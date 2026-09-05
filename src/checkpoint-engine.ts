@@ -132,7 +132,9 @@ export class CheckpointEngine {
           filename
         );
 
-        const savedTokens = resp.n_tokens ?? currentTokens;
+        const savedTokens = resp.n_saved ?? resp.n_tokens ?? currentTokens;
+        const savedBytes = resp.n_written ?? resp.n_bytes ?? 0;
+        const saveMs = resp.timings?.save_ms ?? resp.t_ms ?? 0;
         this.sessionSavedTokens.set(sessionId, savedTokens);
 
         const existingMeta = await this.lru.readMetadata(metaPath);
@@ -142,7 +144,7 @@ export class CheckpointEngine {
           sessionId,
           sessionName,
           tokenCount: savedTokens,
-          fileSizeBytes: resp.n_bytes ?? 0,
+          fileSizeBytes: savedBytes,
           createdAt: existingMeta?.createdAt || now,
           lastAccessedAt: now,
           promptPrefixHash: existingMeta?.promptPrefixHash || "",
@@ -157,8 +159,8 @@ export class CheckpointEngine {
         if (onSuccess) {
           onSuccess({
             tokens: savedTokens,
-            durationMs: resp.t_ms || 0,
-            bytes: resp.n_bytes || 0,
+            durationMs: saveMs,
+            bytes: savedBytes,
           });
         }
       } catch (err) {

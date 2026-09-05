@@ -118,6 +118,7 @@ export class LruManager {
       try {
         await fs.unlink(oldest.binPath);
         await fs.unlink(oldest.metaPath);
+        await fs.unlink(`${oldest.binPath}.media.json`).catch(() => {});
         prunedFiles.push(oldest.binFilename);
         freedBytes += oldest.meta.fileSizeBytes;
         totalBytes -= oldest.meta.fileSizeBytes;

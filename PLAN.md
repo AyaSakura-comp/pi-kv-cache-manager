@@ -95,8 +95,8 @@ Without bounded storage, saving multiple 110k-token sessions (each ~2.2 GB) will
 
 ### Architecture Specification
 1. **Configurable Constraints**:
-   * `maxSessions`: Maximum number of stored session snapshots (default: `5`, ~10~12 GB).
-   * `maxDiskUsageGb`: Hard disk quota in GB (default: `30` GB).
+   * `maxSessions`: Maximum number of stored session snapshots (default: `30`).
+   * `maxDiskUsageGb`: Hard disk quota in GB (default: `40` GB).
    * `cacheDir`: Storage root (default: `~/.cache/llama-slots/`).
 2. **Metadata Sidecar (`<snapshot>.meta.json`)**:
    Every `<name>.bin` has a lightweight `<name>.meta.json`:

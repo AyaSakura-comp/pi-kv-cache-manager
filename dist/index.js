@@ -12,11 +12,37 @@ function formatTokens(n) {
         return `${(n / 1000).toFixed(1)}k`;
     return String(n);
 }
+function notifyUser(ctx, message, type = "info") {
+    if (ctx.hasUI) {
+        try {
+            ctx.ui.notify(message, type);
+            return;
+        }
+        catch {
+            // Fallback to console
+        }
+    }
+    if (type === "error") {
+        console.error(message);
+    }
+    else if (type === "warning") {
+        console.warn(message);
+    }
+    else {
+        console.log(message);
+    }
+}
 export default function piKvCacheManager(pi) {
     const config = loadConfig();
     const lru = new LruManager(config.cacheDir);
     const engine = new CheckpointEngine(config, lru);
     const baseCache = new BaseCacheManager(config, lru);
+    // Hook 0: Bind requests directly to the managed slot
+    pi.on("before_provider_request", (event) => {
+        if (event.payload && typeof event.payload === "object") {
+            event.payload.id_slot = config.slotId;
+        }
+    });
     // Hook 1: Session Start (Cold boot or resume)
     pi.on("session_start", async (_event, ctx) => {
         try {
@@ -38,10 +64,11 @@ export default function piKvCacheManager(pi) {
                 try {
                     const resp = await restoreSlot(config.llamaServerUrl, config.slotId, snapFilename);
                     await lru.touchSnapshot(snapFilename);
-                    const tokens = resp.n_tokens ?? 0;
+                    const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
+                    const restoreMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
                     engine.setSavedTokens(sessionId, tokens);
                     ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} ⚡`);
-                    ctx.ui.notify(`Restored KV cache: ${tokens.toLocaleString()} tokens in ${resp.t_ms?.toFixed(1) || 0}ms (⚡ instant resume)`, "info");
+                    ctx.ui.notify(`Restored KV cache: ${tokens.toLocaleString()} tokens in ${restoreMs.toFixed(1)}ms (⚡ instant resume)`, "info");
                     return;
                 }
                 catch (err) {
@@ -60,8 +87,13 @@ export default function piKvCacheManager(pi) {
                     else if (res.status === "miss") {
                         // Background pre-warm and snapshot Golden Base for future sessions
                         baseCache.warmAndSave(systemPrompt, res.hash).then((warmInfo) => {
-                            ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(warmInfo.tokens)} 💾`);
-                            ctx.ui.notify(`Created Golden Base KV cache: ${warmInfo.tokens.toLocaleString()} tokens saved for instant future boots.`, "info");
+                            try {
+                                ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(warmInfo.tokens)} 💾`);
+                                ctx.ui.notify(`Created Golden Base KV cache: ${warmInfo.tokens.toLocaleString()} tokens saved for instant future boots.`, "info");
+                            }
+                            catch {
+                                // Ignore stale context if session switched
+                            }
                         }).catch((err) => {
                             console.warn(`[pi-kv-cache-manager] Failed to warm base cache:`, err);
                         });
@@ -83,10 +115,18 @@ export default function piKvCacheManager(pi) {
             const currentTokens = usage?.tokens || 0;
             const sessionName = ctx.sessionManager?.getSessionName?.();
             await engine.maybeCheckpoint(sessionId, sessionName, currentTokens, (info) => {
-                ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(info.tokens)} 💾`);
-                // Live status update without interrupting chat
+                try {
+                    if (ctx.hasUI) {
+                        ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(info.tokens)} 💾`);
+                    }
+                }
+                catch {
+                    // Ignore stale context if print mode or session exited
+                }
             }, (err) => {
-                console.warn(`[pi-kv-cache-manager] Incremental save error:`, err);
+                if (!String(err).includes("stale after session")) {
+                    console.warn(`[pi-kv-cache-manager] Incremental save error:`, err);
+                }
             });
         }
         catch (err) {
@@ -146,7 +186,7 @@ export default function piKvCacheManager(pi) {
                             lines.push(`| ${label} | ${s.meta.tokenCount.toLocaleString()} | ${LruManager.formatBytes(s.meta.fileSizeBytes)} | ${new Date(s.meta.lastAccessedAt).toLocaleString()} |`);
                         }
                     }
-                    ctx.ui.notify(lines.join("\n"), "info");
+                    notifyUser(ctx, lines.join("\n"), "info");
                     break;
                 }
                 case "save": {
@@ -156,28 +196,33 @@ export default function piKvCacheManager(pi) {
                         ? `snap_${sanitizeFilename(customName)}.bin`
                         : engine.getSnapshotFilename(sessionId);
                     try {
-                        ctx.ui.notify(`Saving KV snapshot to \`${filename}\`...`, "info");
+                        notifyUser(ctx, `Saving KV snapshot to \`${filename}\`...`, "info");
                         const resp = await saveSlot(config.llamaServerUrl, config.slotId, filename);
-                        const tokens = resp.n_tokens ?? 0;
+                        const tokens = resp.n_saved ?? resp.n_tokens ?? 0;
+                        const bytes = resp.n_written ?? resp.n_bytes ?? 0;
+                        const saveMs = resp.timings?.save_ms ?? resp.t_ms ?? 0;
                         engine.setSavedTokens(sessionId, tokens);
                         const metaPath = path.join(config.cacheDir, filename.replace(/\.bin$/, ".meta.json"));
                         await lru.writeMetadata(metaPath, {
                             sessionId,
                             sessionName: customName || ctx.sessionManager?.getSessionName?.(),
                             tokenCount: tokens,
-                            fileSizeBytes: resp.n_bytes ?? 0,
+                            fileSizeBytes: bytes,
                             createdAt: new Date().toISOString(),
                             lastAccessedAt: new Date().toISOString(),
                             promptPrefixHash: "",
                             isBaseSnapshot: false,
                         });
                         await lru.enforceLRU(config);
-                        ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} 💾`);
-                        ctx.ui.notify(`✅ Successfully saved ${tokens.toLocaleString()} tokens (${LruManager.formatBytes(resp.n_bytes ?? 0)}) in ${resp.t_ms?.toFixed(1) || 0}ms`, "info");
+                        try {
+                            ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} 💾`);
+                        }
+                        catch { }
+                        notifyUser(ctx, `✅ Successfully saved ${tokens.toLocaleString()} tokens (${LruManager.formatBytes(bytes)}) in ${saveMs.toFixed(1)}ms`, "info");
                     }
                     catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
-                        ctx.ui.notify(`❌ Failed to save snapshot: ${msg}`, "error");
+                        notifyUser(ctx, `❌ Failed to save snapshot: ${msg}`, "error");
                     }
                     break;
                 }
@@ -188,17 +233,21 @@ export default function piKvCacheManager(pi) {
                         ? (customName.endsWith(".bin") ? customName : `snap_${sanitizeFilename(customName)}.bin`)
                         : engine.getSnapshotFilename(sessionId);
                     try {
-                        ctx.ui.notify(`Restoring KV snapshot from \`${filename}\`...`, "info");
+                        notifyUser(ctx, `Restoring KV snapshot from \`${filename}\`...`, "info");
                         const resp = await restoreSlot(config.llamaServerUrl, config.slotId, filename);
                         await lru.touchSnapshot(filename);
-                        const tokens = resp.n_tokens ?? 0;
+                        const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
+                        const restoreMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
                         engine.setSavedTokens(sessionId, tokens);
-                        ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} ⚡`);
-                        ctx.ui.notify(`✅ Successfully restored ${tokens.toLocaleString()} tokens in ${resp.t_ms?.toFixed(1) || 0}ms`, "info");
+                        try {
+                            ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} ⚡`);
+                        }
+                        catch { }
+                        notifyUser(ctx, `✅ Successfully restored ${tokens.toLocaleString()} tokens in ${restoreMs.toFixed(1)}ms`, "info");
                     }
                     catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
-                        ctx.ui.notify(`❌ Failed to restore snapshot: ${msg}`, "error");
+                        notifyUser(ctx, `❌ Failed to restore snapshot: ${msg}`, "error");
                     }
                     break;
                 }
@@ -206,40 +255,43 @@ export default function piKvCacheManager(pi) {
                     try {
                         const result = await lru.enforceLRU(config);
                         if (result.prunedFiles.length > 0) {
-                            ctx.ui.notify(`🧹 Evicted ${result.prunedFiles.length} snapshot(s) (${LruManager.formatBytes(result.freedBytes)} freed):\n${result.prunedFiles.join(", ")}`, "info");
+                            notifyUser(ctx, `🧹 Evicted ${result.prunedFiles.length} snapshot(s) (${LruManager.formatBytes(result.freedBytes)} freed):\n${result.prunedFiles.join(", ")}`, "info");
                         }
                         else {
-                            ctx.ui.notify(`LRU cache is already within quota limits. Nothing to evict.`, "info");
+                            notifyUser(ctx, `LRU cache is already within quota limits. Nothing to evict.`, "info");
                         }
                     }
                     catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
-                        ctx.ui.notify(`❌ Prune failed: ${msg}`, "error");
+                        notifyUser(ctx, `❌ Prune failed: ${msg}`, "error");
                     }
                     break;
                 }
                 case "base-update": {
                     if (typeof ctx.getSystemPrompt !== "function") {
-                        ctx.ui.notify("System prompt unavailable in this context.", "warning");
+                        notifyUser(ctx, "System prompt unavailable in this context.", "warning");
                         return;
                     }
                     const prompt = ctx.getSystemPrompt();
                     const hash = computeHash(prompt);
                     try {
-                        ctx.ui.notify("Prefilling system prompt and skills into slot 0...", "info");
+                        notifyUser(ctx, "Prefilling system prompt and skills into slot 0...", "info");
                         const info = await baseCache.warmAndSave(prompt, hash);
-                        ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(info.tokens)} 💾`);
-                        ctx.ui.notify(`✅ Golden Base cache refreshed: ${info.tokens.toLocaleString()} tokens (${LruManager.formatBytes(info.bytes)}) saved in ${info.durationMs.toFixed(1)}ms`, "info");
+                        try {
+                            ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(info.tokens)} 💾`);
+                        }
+                        catch { }
+                        notifyUser(ctx, `✅ Golden Base cache refreshed: ${info.tokens.toLocaleString()} tokens (${LruManager.formatBytes(info.bytes)}) saved in ${info.durationMs.toFixed(1)}ms`, "info");
                     }
                     catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
-                        ctx.ui.notify(`❌ Base update failed: ${msg}`, "error");
+                        notifyUser(ctx, `❌ Base update failed: ${msg}`, "error");
                     }
                     break;
                 }
                 case "help":
                 default: {
-                    ctx.ui.notify(`**Pi KV Cache Manager Commands**:\n` +
+                    notifyUser(ctx, `**Pi KV Cache Manager Commands**:\n` +
                         `- \`/kv status\` : Show current cache usage, active tokens, and snapshot table\n` +
                         `- \`/kv save [name]\` : Manually snapshot current session or named file\n` +
                         `- \`/kv restore [name]\` : Restore session or named snapshot\n` +

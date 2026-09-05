@@ -76,8 +76,8 @@ export class BaseCacheManager {
       return {
         status: "hit",
         hash: currentHash,
-        tokens: resp.n_tokens ?? meta.tokenCount,
-        durationMs: resp.t_ms,
+        tokens: resp.n_restored ?? resp.n_tokens ?? meta.tokenCount,
+        durationMs: resp.timings?.restore_ms ?? resp.t_ms ?? 0,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -120,11 +120,15 @@ export class BaseCacheManager {
     );
 
     const now = new Date().toISOString();
+    const savedTokens = saveResp.n_saved ?? saveResp.n_tokens ?? 0;
+    const savedBytes = saveResp.n_written ?? saveResp.n_bytes ?? 0;
+    const durationMs = saveResp.timings?.save_ms ?? saveResp.t_ms ?? 0;
+
     const meta: SnapshotMetadata = {
       sessionId: "base_system_prompt",
       sessionName: "Golden Base (System Prompt + Skills)",
-      tokenCount: saveResp.n_tokens ?? 0,
-      fileSizeBytes: saveResp.n_bytes ?? 0,
+      tokenCount: savedTokens,
+      fileSizeBytes: savedBytes,
       createdAt: now,
       lastAccessedAt: now,
       promptPrefixHash: hash,
@@ -134,9 +138,9 @@ export class BaseCacheManager {
     await this.lru.writeMetadata(this.getMetaPath(), meta);
 
     return {
-      tokens: saveResp.n_tokens ?? 0,
-      durationMs: saveResp.t_ms ?? 0,
-      bytes: saveResp.n_bytes ?? 0,
+      tokens: savedTokens,
+      durationMs,
+      bytes: savedBytes,
     };
   }
 }

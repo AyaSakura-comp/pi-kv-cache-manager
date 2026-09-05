@@ -21,6 +21,11 @@
   ],
   "author": "chihmin",
   "license": "MIT",
+  "pi": {
+    "extensions": [
+      "dist/index.js"
+    ]
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.1.0"
   },

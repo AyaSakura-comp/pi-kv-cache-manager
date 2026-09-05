@@ -34,7 +34,7 @@ Instead of re-evaluating 150k tokens (consuming ~2.8 minutes of 100W APU heat), 
 
 2. **LRU Session Quota & Sidecar Metadata**:
    - Maintains `.meta.json` sidecars tracking `sessionId`, `sessionName`, `tokenCount`, `fileSizeBytes`, and `lastAccessedAt`.
-   - Automatically evicts the oldest snapshots when stored sessions exceed `maxSessions` (default: 5) or hard disk quota `maxDiskUsageGb` (default: 30 GB).
+   - Automatically evicts the oldest snapshots when stored sessions exceed `maxSessions` (default: 30) or hard disk quota `maxDiskUsageGb` (default: 40 GB).
 
 3. **Incremental Lazy Checkpointing**:
    - Saves slot state asynchronously on `turn_end` without stalling conversation.
@@ -91,8 +91,8 @@ Add a `kvCache` block to `~/.pi/agent/settings.json` or `.pi/settings.json`:
     "llamaServerUrl": "http://127.0.0.1:8001",
     "slotId": 0,
     "cacheDir": "/home/chihmin/.cache/llama-slots",
-    "maxSessions": 5,
-    "maxDiskUsageGb": 30,
+    "maxSessions": 30,
+    "maxDiskUsageGb": 40,
     "minTokensThreshold": 25000,
     "stepTokensIncrement": 5000,
     "enableBaseCache": true,

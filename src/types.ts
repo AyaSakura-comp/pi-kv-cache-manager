@@ -9,9 +9,9 @@ export interface KvManagerConfig {
   slotId: number;
   /** Storage directory for KV snapshots and metadata sidecars */
   cacheDir: string;
-  /** Maximum number of session snapshots to keep in LRU cache (default: 5) */
+  /** Maximum number of session snapshots to keep in LRU cache (default: 30) */
   maxSessions: number;
-  /** Hard disk quota in Gigabytes before eviction occurs (default: 30) */
+  /** Hard disk quota in Gigabytes before eviction occurs (default: 40) */
   maxDiskUsageGb: number;
   /** Minimum token threshold before automatic snapshot saving activates (default: 25000) */
   minTokensThreshold: number;
@@ -39,8 +39,16 @@ export interface LlamaSlotActionResponse {
   id_slot?: number;
   filename?: string;
   is_save?: boolean;
+  n_saved?: number;
+  n_restored?: number;
   n_tokens?: number;
+  n_written?: number;
+  n_read?: number;
   n_bytes?: number;
+  timings?: {
+    save_ms?: number;
+    restore_ms?: number;
+  };
   t_ms?: number;
   error?: {
     code: number;
