@@ -1,0 +1,31 @@
+{
+  "name": "pi-kv-cache-manager",
+  "version": "0.1.0",
+  "description": "Intelligent KV cache snapshot lifecycle manager for Pi Agent with llama.cpp",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "pi-agent",
+    "pi-extension",
+    "llama.cpp",
+    "kv-cache",
+    "prompt-caching",
+    "strix-halo",
+    "rocm"
+  ],
+  "author": "chihmin",
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  }
+}

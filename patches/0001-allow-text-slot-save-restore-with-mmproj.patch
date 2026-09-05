@@ -1,0 +1,88 @@
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 4681f9c51..0cc122df1 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -206,6 +206,8 @@ public:
+         tokens.clear();
+     }
+ 
++    bool has_media() const { return !map_idx_to_media.empty(); }
++
+     void keep_first(size_t n);
+ 
+     std::string detokenize(const llama_context * ctx, bool special) const;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 3f20c94c5..717ec8c09 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1571,6 +1571,14 @@ private:
+         return true;
+     }
+ 
++    bool check_no_mtmd_slot(const int id_task, const server_slot * slot) {
++        if (slot && slot->prompt.tokens.has_media()) {
++            send_error(id_task, "Slot action is not supported for slots containing multimodal media chunks", ERROR_TYPE_NOT_SUPPORTED);
++            return false;
++        }
++        return true;
++    }
++
+     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress) {
+         auto res = std::make_unique<server_task_result_cmpl_partial>();
+ 
+@@ -1979,16 +1987,15 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_SAVE:
+                 {
+-                    if (!check_no_mtmd(task.id)) {
+-                        break;
+-                    }
+-
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {
+                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                         break;
+                     }
++                    if (!check_no_mtmd_slot(task.id, slot)) {
++                        break;
++                    }
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+@@ -2020,13 +2027,15 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_RESTORE:
+                 {
+-                    if (!check_no_mtmd(task.id)) break;
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {
+                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                         break;
+                     }
++                    if (!check_no_mtmd_slot(task.id, slot)) {
++                        break;
++                    }
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+@@ -2067,15 +2076,15 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_ERASE:
+                 {
+-                    if (!check_no_mtmd(task.id)) {
+-                        break;
+-                    }
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {
+                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                         break;
+                     }
++                    if (!check_no_mtmd_slot(task.id, slot)) {
++                        break;
++                    }
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
