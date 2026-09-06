@@ -100,7 +100,7 @@ graph TB
 
     subgraph StorageLayer ["NVMe Snapshot Storage (~/.cache/llama-slots/)"]
         BaseFiles[("Golden Base Snapshot<br/>• base_system_prompt.bin<br/>• base_system_prompt.meta.json")]
-        SessionFiles[("Session Checkpoints<br/>• snap_<id>.bin<br/>• snap_<id>.meta.json<br/>• snap_<id>.bin.media.json")]
+        SessionFiles[("Session Checkpoints<br/>• snap_session_id.bin<br/>• snap_session_id.meta.json<br/>• snap_session_id.bin.media.json")]
     end
 
     SlashCmd --> ExtEntry
@@ -134,12 +134,12 @@ sequenceDiagram
     Llama-->>SlotMgr: Array of slot metadata
 
     alt Case 1: Direct RAM Hit (Already Resident in Slot)
-        Note over SlotMgr: Slot X already holds snap_<id>.bin
+        Note over SlotMgr: Slot X already holds snap_session_id.bin
         SlotMgr-->>Ext: { slotId: X, hit: true, restored: false }
         Ext->>Ext: Bind id_slot = X for provider request (⚡ 0ms disk read)
     else Case 2: Session Checkpoint on NVMe (Restore Needed)
         SlotMgr->>SlotMgr: Pick idle or LRU slot Y (smallest t_last_used)
-        SlotMgr->>Llama: POST /slots/Y?action=restore&filename=snap_<id>.bin
+        SlotMgr->>Llama: POST /slots/Y?action=restore&filename=snap_session_id.bin
         Llama->>Disk: Read binary KV cache from NVMe (~160ms for 78k tokens)
         Llama-->>SlotMgr: { n_restored: 78974, timings: { restore_ms: 162.4 } }
         SlotMgr-->>Ext: { slotId: Y, hit: false, restored: true }
@@ -183,10 +183,10 @@ sequenceDiagram
     else Checkpoint Threshold Met
         Ext->>Engine: queueLazySave(sessionId, tokens, slotId=0)
         Note over Engine: Runs asynchronously; does NOT block user chat
-        Engine->>Llama: POST /slots/0?action=save&filename=session_<id>.bin
+        Engine->>Llama: POST /slots/0?action=save&filename=session_session_id.bin
         Llama->>Disk: Save binary KV tensors to NVMe
         Llama-->>Engine: { n_saved: 45000, n_written: 960000000, timings: { save_ms: 95.4 } }
-        Engine->>Disk: Write session_<id>.meta.json
+        Engine->>Disk: Write session_session_id.meta.json
         Engine->>Lru: enforceLRU(config)
         Note over Lru,Disk: Check 30 sessions max & 40 GB limit
         Lru-->>Engine: Quota compliant
@@ -203,21 +203,21 @@ The LRU engine guarantees that stored KV snapshots never exhaust disk space:
 
 ```mermaid
 flowchart TD
-    Start([Trigger: enforceLRU]) --> ReadMetas[Scan directory for *.meta.json files]
-    ReadMetas --> FilterNonBase[Filter out isBaseSnapshot == true]
-    FilterNonBase --> SortAsc[Sort snapshots ascending by lastAccessedAt]
-    SortAsc --> CalcUsage[Calculate total disk usage in bytes]
+    Start(["Trigger: enforceLRU"]) --> ReadMetas["Scan directory for *.meta.json files"]
+    ReadMetas --> FilterNonBase["Filter out isBaseSnapshot == true"]
+    FilterNonBase --> SortAsc["Sort snapshots ascending by lastAccessedAt"]
+    SortAsc --> CalcUsage["Calculate total disk usage in bytes"]
     
-    CalcUsage --> CheckQuota{Snapshots > maxSessions (30)<br/>OR<br/>TotalBytes > maxDiskUsageGb (40 GB)?}
+    CalcUsage --> CheckQuota{"Snapshots > maxSessions (30)<br/>OR<br/>TotalBytes > maxDiskUsageGb (40 GB)?"}
     
-    CheckQuota -- No --> Done([LRU Quota Satisfied])
-    CheckQuota -- Yes --> PickOldest[Pick oldest snapshot in sorted queue]
+    CheckQuota -- No --> Done(["LRU Quota Satisfied"])
+    CheckQuota -- Yes --> PickOldest["Pick oldest snapshot in sorted queue"]
     
-    PickOldest --> UnlinkBin[Unlink snapshot.bin]
-    UnlinkBin --> UnlinkMeta[Unlink snapshot.meta.json]
-    UnlinkMeta --> UnlinkMedia[Unlink snapshot.bin.media.json if exists]
+    PickOldest --> UnlinkBin["Unlink snapshot.bin"]
+    UnlinkBin --> UnlinkMeta["Unlink snapshot.meta.json"]
+    UnlinkMeta --> UnlinkMedia["Unlink snapshot.bin.media.json if exists"]
     
-    UnlinkMedia --> UpdateStats[Subtract file size from totalBytes<br/>Remove from snapshot list]
+    UnlinkMedia --> UpdateStats["Subtract file size from totalBytes<br/>Remove from snapshot list"]
     UpdateStats --> CheckQuota
 ```
 
