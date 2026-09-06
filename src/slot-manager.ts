@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import type { KvManagerConfig, LlamaSlotInfo } from "./types.js";
 import { fetchSlots, restoreSlot, eraseSlot, CheckpointEngine } from "./checkpoint-engine.js";
 import { LruManager } from "./lru-manager.js";
-import { BaseCacheManager } from "./base-cache.js";
+import { BaseCacheManager, BASE_SNAPSHOT_BIN } from "./base-cache.js";
 
 export interface SlotResolutionResult {
   slotId: number;
@@ -76,7 +76,11 @@ export class SlotManager {
       if (activeSid === sessionId) {
         const live = slots.find((s) => s.id === slotId);
         if (live) {
-          if (live.snapshot_filename && live.snapshot_filename !== snapFilename) {
+          if (
+            live.snapshot_filename &&
+            live.snapshot_filename !== snapFilename &&
+            live.snapshot_filename !== BASE_SNAPSHOT_BIN
+          ) {
             this.activeSlotSessions.delete(slotId);
           } else {
             return {
@@ -162,6 +166,17 @@ export class SlotManager {
     // 4. If new session (no snapshot on disk), check Golden Base Cache
     // ONLY check/warm if tools are provided (ensures full system prompt + tool schemas are present)
     if (this.config.enableBaseCache && systemPrompt && systemPrompt.length > 0 && tools !== undefined) {
+      const targetLive = slots.find((s) => s.id === targetSlotId);
+      if (targetLive?.snapshot_filename === BASE_SNAPSHOT_BIN) {
+        this.activeSlotSessions.set(targetSlotId, sessionId);
+        return {
+          slotId: targetSlotId,
+          hit: true,
+          restored: false,
+          isBase: true,
+        };
+      }
+
       const baseRes = await this.baseCache.checkAndRestore(systemPrompt, targetSlotId, tools);
       if (baseRes.status === "hit") {
         this.activeSlotSessions.set(targetSlotId, sessionId);

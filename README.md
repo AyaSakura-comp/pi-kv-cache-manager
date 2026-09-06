@@ -418,7 +418,8 @@ pi-kv-cache-manager/
 ├── package.json                # NPM Manifest & TypeScript Scripts
 ├── tsconfig.json               # ES2022 / NodeNext TypeScript Configuration
 ├── patches/
-│   └── 0001-allow-text-slot-save-restore-with-mmproj.patch # Upstream PR patch for llama.cpp
+│   ├── 0001-allow-text-slot-save-restore-with-mmproj.patch # Upstream PR patch for llama.cpp
+│   └── 0002-sync-mtp-draft-kv-cache-slots.patch           # Dual-track MTP draft KV sync & checkpoint fix
 └── src/
     ├── index.ts                # Pi Agent Extension Entry Point, Hooks & Command Wiring
     ├── config.ts               # Configuration Loader & Defaults (30 sessions / 40GB)
