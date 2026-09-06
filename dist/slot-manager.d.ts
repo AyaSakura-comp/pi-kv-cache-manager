@@ -15,7 +15,10 @@ export declare class SlotManager {
     private lru;
     private engine;
     private baseCache;
+    private activeSlotSessions;
     constructor(config: KvManagerConfig, lru: LruManager, engine: CheckpointEngine, baseCache: BaseCacheManager);
-    ensureSlotForSession(sessionId: string, systemPrompt?: string): Promise<SlotResolutionResult>;
+    getActiveSlot(sessionId: string): number | undefined;
+    clearSession(sessionId: string): void;
+    ensureSlotForSession(sessionId: string, systemPrompt?: string, tools?: unknown[]): Promise<SlotResolutionResult>;
 }
 //# sourceMappingURL=slot-manager.d.ts.map

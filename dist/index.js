@@ -87,12 +87,14 @@ export default function piKvCacheManager(pi) {
     const baseCache = new BaseCacheManager(config, lru);
     const slotManager = new SlotManager(config, lru, engine, baseCache);
     const sessionSlots = new Map();
-    const activateSessionSlot = async (ctx) => {
+    const activateSessionSlot = async (ctx, systemPromptOverride, toolsOverride) => {
         const sessionId = ctx.sessionManager?.getSessionId();
         if (!sessionId)
             return config.slotId;
-        const systemPrompt = typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : undefined;
-        const res = await slotManager.ensureSlotForSession(sessionId, systemPrompt);
+        const systemPrompt = systemPromptOverride ??
+            (typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : undefined);
+        const tools = toolsOverride;
+        const res = await slotManager.ensureSlotForSession(sessionId, systemPrompt, tools);
         sessionSlots.set(sessionId, res.slotId);
         if (res.restored) {
             const label = res.isBase ? `Base ${formatTokens(res.tokens ?? 0)}` : formatTokens(res.tokens ?? 0);
@@ -119,15 +121,18 @@ export default function piKvCacheManager(pi) {
         return res.slotId;
     };
     // Hook 0: Bind outgoing provider requests directly to the allocated slot (STRICTLY for llama-server)
-    pi.on("before_provider_request", (event, ctx) => {
+    pi.on("before_provider_request", async (event, ctx) => {
         if (!isLlamaServerContext(ctx, config)) {
             if (event.payload && typeof event.payload === "object") {
                 delete event.payload.id_slot;
             }
             return;
         }
-        const sessionId = ctx?.sessionManager?.getSessionId();
-        const slotId = (sessionId && sessionSlots.get(sessionId)) ?? config.slotId;
+        const payload = event.payload;
+        const systemPrompt = (payload?.messages && payload.messages[0]?.role === "system" ? payload.messages[0].content : undefined) ??
+            (typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : undefined);
+        const tools = payload?.tools;
+        const slotId = await activateSessionSlot(ctx, systemPrompt, tools);
         if (event.payload && typeof event.payload === "object") {
             event.payload.id_slot = slotId;
         }
@@ -213,9 +218,14 @@ export default function piKvCacheManager(pi) {
             }
         }
     });
-    // Hook 3: Session Shutdown (Cleanup UI status)
+    // Hook 3: Session Shutdown (Cleanup UI status and slot session tracking)
     pi.on("session_shutdown", async (_event, ctx) => {
         try {
+            const sessionId = ctx.sessionManager?.getSessionId();
+            if (sessionId) {
+                slotManager.clearSession(sessionId);
+                sessionSlots.delete(sessionId);
+            }
             ctx.ui.setStatus(STATUS_KEY, undefined);
         }
         catch {
@@ -377,15 +387,20 @@ export default function piKvCacheManager(pi) {
                     break;
                 }
                 case "base-update": {
+                    if (!isLlamaServerContext(ctx, config)) {
+                        notifyUser(ctx, `⚠️ Base cache update is only available for local llama-server models.`, "warning");
+                        break;
+                    }
                     if (typeof ctx.getSystemPrompt !== "function") {
                         notifyUser(ctx, "System prompt unavailable in this context.", "warning");
                         return;
                     }
                     const prompt = ctx.getSystemPrompt();
-                    const hash = computeHash(prompt);
+                    const tools = await baseCache.loadCachedTools();
+                    const hash = computeHash(prompt, tools);
                     try {
-                        notifyUser(ctx, "Prefilling system prompt and skills into an available slot...", "info");
-                        const info = await baseCache.warmAndSave(prompt, hash);
+                        notifyUser(ctx, "Prefilling system prompt and tools into an available slot...", "info");
+                        const info = await baseCache.warmAndSave(prompt, hash, undefined, tools);
                         try {
                             ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(info.tokens)} (S${info.slotId}) 💾`);
                         }

@@ -19,6 +19,7 @@ export class SlotManager {
   private lru: LruManager;
   private engine: CheckpointEngine;
   private baseCache: BaseCacheManager;
+  private activeSlotSessions = new Map<number, string>(); // slotId -> sessionId
 
   constructor(
     config: KvManagerConfig,
@@ -32,9 +33,25 @@ export class SlotManager {
     this.baseCache = baseCache;
   }
 
+  getActiveSlot(sessionId: string): number | undefined {
+    for (const [slotId, sid] of this.activeSlotSessions.entries()) {
+      if (sid === sessionId) return slotId;
+    }
+    return undefined;
+  }
+
+  clearSession(sessionId: string): void {
+    for (const [slotId, sid] of this.activeSlotSessions.entries()) {
+      if (sid === sessionId) {
+        this.activeSlotSessions.delete(slotId);
+      }
+    }
+  }
+
   async ensureSlotForSession(
     sessionId: string,
-    systemPrompt?: string
+    systemPrompt?: string,
+    tools?: unknown[]
   ): Promise<SlotResolutionResult> {
     const snapFilename = this.engine.getSnapshotFilename(sessionId);
     let slots: LlamaSlotInfo[] = [];
@@ -54,9 +71,24 @@ export class SlotManager {
     }
 
     // 1. Direct RAM Cache Hit:
-    // Does any slot currently have our snapshot_filename loaded?
+    // A) Is this session currently tracked as active in one of our slots?
+    for (const [slotId, activeSid] of this.activeSlotSessions.entries()) {
+      if (activeSid === sessionId) {
+        const live = slots.find((s) => s.id === slotId);
+        if (live) {
+          return {
+            slotId,
+            hit: true,
+            restored: false,
+          };
+        }
+      }
+    }
+
+    // B) Does any slot currently have our snapshot_filename loaded?
     const residentSlot = slots.find((s) => s.snapshot_filename === snapFilename);
     if (residentSlot) {
+      this.activeSlotSessions.set(residentSlot.id, sessionId);
       return {
         slotId: residentSlot.id,
         hit: true,
@@ -70,10 +102,17 @@ export class SlotManager {
     const candidates = idleSlots.length > 0 ? idleSlots : slots;
 
     // Selection priority:
-    // Priority A: An empty / fresh slot (no snapshot loaded)
-    let chosenSlot = candidates.find((s) => !s.snapshot_filename);
+    // Priority A: An empty / fresh slot not actively assigned to another session
+    let chosenSlot = candidates.find(
+      (s) => !s.snapshot_filename && !this.activeSlotSessions.has(s.id)
+    );
 
-    // Priority B: The least recently used slot (smallest t_last_used)
+    // Priority B: Any slot not actively assigned to another session
+    if (!chosenSlot) {
+      chosenSlot = candidates.find((s) => !this.activeSlotSessions.has(s.id));
+    }
+
+    // Priority C: The least recently used slot (smallest t_last_used)
     if (!chosenSlot) {
       chosenSlot = [...candidates].sort((a, b) => (a.t_last_used ?? 0) - (b.t_last_used ?? 0))[0];
     }
@@ -96,6 +135,7 @@ export class SlotManager {
       const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
       const durationMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
       this.engine.setSavedTokens(sessionId, tokens);
+      this.activeSlotSessions.set(targetSlotId, sessionId);
 
       return {
         slotId: targetSlotId,
@@ -107,9 +147,11 @@ export class SlotManager {
     }
 
     // 4. If new session (no snapshot on disk), check Golden Base Cache
-    if (this.config.enableBaseCache && systemPrompt && systemPrompt.length > 0) {
-      const baseRes = await this.baseCache.checkAndRestore(systemPrompt, targetSlotId);
+    // ONLY check/warm if tools are provided (ensures full system prompt + tool schemas are present)
+    if (this.config.enableBaseCache && systemPrompt && systemPrompt.length > 0 && tools !== undefined) {
+      const baseRes = await this.baseCache.checkAndRestore(systemPrompt, targetSlotId, tools);
       if (baseRes.status === "hit") {
+        this.activeSlotSessions.set(targetSlotId, sessionId);
         return {
           slotId: targetSlotId,
           hit: false,
@@ -119,9 +161,10 @@ export class SlotManager {
           durationMs: baseRes.durationMs,
         };
       } else if (baseRes.status === "miss") {
-        // Auto-warm and snapshot Golden Base on miss (system prompt changed or first run)
+        // Auto-warm and snapshot Golden Base on miss (system prompt or tools changed or first run)
         try {
-          const warmRes = await this.baseCache.warmAndSave(systemPrompt, baseRes.hash, targetSlotId);
+          const warmRes = await this.baseCache.warmAndSave(systemPrompt, baseRes.hash, targetSlotId, tools);
+          this.activeSlotSessions.set(targetSlotId, sessionId);
           return {
             slotId: targetSlotId,
             hit: false,
@@ -136,14 +179,18 @@ export class SlotManager {
       }
     }
 
-    // 5. If no snapshot and no base cache, but target slot had a previous session's snapshot:
+    // 5. If no snapshot and base cache wasn't restored, but target slot had a previous session's snapshot:
     // Erase the slot so stale context does not pollute the new session
-    if (chosenSlot && chosenSlot.snapshot_filename) {
+    if (chosenSlot && (chosenSlot.snapshot_filename || this.activeSlotSessions.has(targetSlotId))) {
       try {
         await eraseSlot(this.config.llamaServerUrl, targetSlotId);
       } catch {
         // Best effort
       }
+    }
+
+    if (tools !== undefined || snapExists) {
+      this.activeSlotSessions.set(targetSlotId, sessionId);
     }
 
     return {

@@ -4,8 +4,13 @@ import * as fs from "node:fs/promises";
 import { saveSlot, restoreSlot, eraseSlot, fetchSlots } from "./checkpoint-engine.js";
 export const BASE_SNAPSHOT_BIN = "base_system_prompt.bin";
 export const BASE_SNAPSHOT_META = "base_system_prompt.meta.json";
-export function computeHash(content) {
-    return crypto.createHash("sha256").update(content, "utf-8").digest("hex");
+export const BASE_TOOLS_JSON = "base_tools.json";
+export function computeHash(content, tools) {
+    const h = crypto.createHash("sha256").update(content, "utf-8");
+    if (tools && Array.isArray(tools) && tools.length > 0) {
+        h.update(JSON.stringify(tools), "utf-8");
+    }
+    return h.digest("hex");
 }
 export class BaseCacheManager {
     config;
@@ -20,18 +25,45 @@ export class BaseCacheManager {
     getBinPath() {
         return path.join(this.config.cacheDir, BASE_SNAPSHOT_BIN);
     }
+    getToolsPath() {
+        return path.join(this.config.cacheDir, BASE_TOOLS_JSON);
+    }
+    async loadCachedTools() {
+        try {
+            const raw = await fs.readFile(this.getToolsPath(), "utf-8");
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed) && parsed.length > 0)
+                return parsed;
+        }
+        catch {
+            // Ignored
+        }
+        return undefined;
+    }
+    async saveCachedTools(tools) {
+        try {
+            await fs.writeFile(this.getToolsPath(), JSON.stringify(tools, null, 2), "utf-8");
+        }
+        catch {
+            // Ignored
+        }
+    }
     async getBaseMetadata() {
         return this.lru.readMetadata(this.getMetaPath());
     }
     /**
-     * Checks whether the current system prompt matches the cached golden base snapshot.
+     * Checks whether the current system prompt + tools match the cached golden base snapshot.
      * If matched, restores it instantly into the slot (~20ms).
      */
-    async checkAndRestore(systemPrompt, slotId = this.config.slotId) {
+    async checkAndRestore(systemPrompt, slotId = this.config.slotId, tools) {
         if (!this.config.enableBaseCache) {
             return { status: "disabled", hash: "" };
         }
-        const currentHash = computeHash(systemPrompt);
+        let effectiveTools = tools;
+        if (effectiveTools === undefined) {
+            effectiveTools = await this.loadCachedTools();
+        }
+        const currentHash = computeHash(systemPrompt, effectiveTools);
         const meta = await this.getBaseMetadata();
         if (!meta || meta.promptPrefixHash !== currentHash) {
             return { status: "miss", hash: currentHash };
@@ -64,8 +96,15 @@ export class BaseCacheManager {
      * Dynamically selects an idle slot (or uses preferredSlotId), formats with /apply-template,
      * and cleanly erases the slot before prefilling.
      */
-    async warmAndSave(systemPrompt, hash, preferredSlotId) {
+    async warmAndSave(systemPrompt, hash, preferredSlotId, tools) {
         const baseUrl = this.config.llamaServerUrl.replace(/\/+$/, "");
+        let effectiveTools = tools;
+        if (effectiveTools === undefined) {
+            effectiveTools = await this.loadCachedTools();
+        }
+        if (effectiveTools && Array.isArray(effectiveTools) && effectiveTools.length > 0) {
+            await this.saveCachedTools(effectiveTools);
+        }
         // 1. Determine target slot dynamically (prefer idle slot)
         let targetSlot = preferredSlotId;
         if (targetSlot === undefined) {
@@ -81,12 +120,17 @@ export class BaseCacheManager {
         // 2. Format prompt via /apply-template if available to ensure chat template token consistency
         let formattedPrompt = systemPrompt;
         try {
+            const templatePayload = {
+                messages: [{ role: "system", content: systemPrompt }],
+                add_generation_prompt: false,
+            };
+            if (effectiveTools && Array.isArray(effectiveTools) && effectiveTools.length > 0) {
+                templatePayload.tools = effectiveTools;
+            }
             const templateRes = await fetch(`${baseUrl}/apply-template`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    messages: [{ role: "system", content: systemPrompt }],
-                }),
+                body: JSON.stringify(templatePayload),
             });
             if (templateRes.ok) {
                 const data = (await templateRes.json());
