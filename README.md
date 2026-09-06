@@ -323,17 +323,29 @@ llama-server \
   --port 8001
 ```
 
-### 3. Install Extension in Pi Agent
-Link the extension directly into Pi's extension directory:
+### 3. Install Extension via Pi Package Manager
+
+Install the package directly into Pi Agent using the built-in package manager:
+
+**Option A: Install from Local Source (Development)**
 ```bash
-mkdir -p ~/.pi/agent/extensions
-ln -s /path/to/pi-kv-cache-manager ~/.pi/agent/extensions/pi-kv-cache-manager
+pi install ~/src/pi-kv-cache-manager
 ```
 
-Build the TypeScript files:
+**Option B: Install from Git Repository**
 ```bash
-cd /path/to/pi-kv-cache-manager
-npm run build
+pi install git:https://github.com/AyaSakura-comp/pi-kv-cache-manager.git
+```
+
+Verify the installation:
+```bash
+pi list
+```
+
+To update or remove:
+```bash
+pi update                               # Updates all git packages
+pi remove ~/src/pi-kv-cache-manager     # Uninstalls package
 ```
 
 ---
