@@ -118,6 +118,21 @@ export class SlotManager {
           tokens: baseRes.tokens,
           durationMs: baseRes.durationMs,
         };
+      } else if (baseRes.status === "miss") {
+        // Auto-warm and snapshot Golden Base on miss (system prompt changed or first run)
+        try {
+          const warmRes = await this.baseCache.warmAndSave(systemPrompt, baseRes.hash, targetSlotId);
+          return {
+            slotId: targetSlotId,
+            hit: false,
+            restored: true,
+            isBase: true,
+            tokens: warmRes.tokens,
+            durationMs: warmRes.durationMs,
+          };
+        } catch (err) {
+          console.warn("[pi-kv-cache-manager] Auto-warming base cache failed, falling back to cold start:", err);
+        }
       }
     }
 

@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import type { KvManagerConfig, SnapshotMetadata } from "./types.js";
-import { saveSlot, restoreSlot } from "./checkpoint-engine.js";
+import { saveSlot, restoreSlot, eraseSlot, fetchSlots } from "./checkpoint-engine.js";
 import { LruManager } from "./lru-manager.js";
 
 export const BASE_SNAPSHOT_BIN = "base_system_prompt.bin";
@@ -88,21 +88,64 @@ export class BaseCacheManager {
   /**
    * Warms the base prompt by sending an evaluation request with n_predict=0,
    * then snapshots the resulting KV cache to disk as base_system_prompt.bin.
+   * Dynamically selects an idle slot (or uses preferredSlotId), formats with /apply-template,
+   * and cleanly erases the slot before prefilling.
    */
   async warmAndSave(
     systemPrompt: string,
-    hash: string
-  ): Promise<{ tokens: number; durationMs: number; bytes: number }> {
-    const completionUrl = `${this.config.llamaServerUrl.replace(/\/+$/, "")}/completion`;
+    hash: string,
+    preferredSlotId?: number
+  ): Promise<{ tokens: number; durationMs: number; bytes: number; slotId: number }> {
+    const baseUrl = this.config.llamaServerUrl.replace(/\/+$/, "");
 
-    // 1. Evaluate prompt with n_predict = 0 to fill slot KV cache
+    // 1. Determine target slot dynamically (prefer idle slot)
+    let targetSlot = preferredSlotId;
+    if (targetSlot === undefined) {
+      try {
+        const slots = await fetchSlots(this.config.llamaServerUrl);
+        const idleSlot = slots.find((s) => !s.is_processing);
+        targetSlot = idleSlot ? idleSlot.id : this.config.slotId;
+      } catch {
+        targetSlot = this.config.slotId;
+      }
+    }
+
+    // 2. Format prompt via /apply-template if available to ensure chat template token consistency
+    let formattedPrompt = systemPrompt;
+    try {
+      const templateRes = await fetch(`${baseUrl}/apply-template`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [{ role: "system", content: systemPrompt }],
+        }),
+      });
+      if (templateRes.ok) {
+        const data = (await templateRes.json()) as { prompt?: string };
+        if (data.prompt) {
+          formattedPrompt = data.prompt;
+        }
+      }
+    } catch {
+      // Fallback to raw systemPrompt if /apply-template is unavailable
+    }
+
+    // 3. Erase target slot first to guarantee a pure, clean prefill (no leftover tokens)
+    try {
+      await eraseSlot(this.config.llamaServerUrl, targetSlot);
+    } catch {
+      // Ignore if slot was already clean
+    }
+
+    // 4. Evaluate formatted prompt with n_predict = 0 to fill slot KV cache
+    const completionUrl = `${baseUrl}/completion`;
     const evalRes = await fetch(completionUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        prompt: systemPrompt,
+        prompt: formattedPrompt,
         n_predict: 0,
-        id_slot: this.config.slotId,
+        id_slot: targetSlot,
         cache_prompt: true,
       }),
     });
@@ -112,10 +155,10 @@ export class BaseCacheManager {
       throw new Error(`Failed to warm base prompt on llama-server: ${text}`);
     }
 
-    // 2. Snapshot the prefilled slot to base_system_prompt.bin
+    // 5. Snapshot the prefilled slot to base_system_prompt.bin
     const saveResp = await saveSlot(
       this.config.llamaServerUrl,
-      this.config.slotId,
+      targetSlot,
       BASE_SNAPSHOT_BIN
     );
 
@@ -141,6 +184,7 @@ export class BaseCacheManager {
       tokens: savedTokens,
       durationMs,
       bytes: savedBytes,
+      slotId: targetSlot,
     };
   }
 }

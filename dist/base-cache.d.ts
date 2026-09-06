@@ -25,11 +25,14 @@ export declare class BaseCacheManager {
     /**
      * Warms the base prompt by sending an evaluation request with n_predict=0,
      * then snapshots the resulting KV cache to disk as base_system_prompt.bin.
+     * Dynamically selects an idle slot (or uses preferredSlotId), formats with /apply-template,
+     * and cleanly erases the slot before prefilling.
      */
-    warmAndSave(systemPrompt: string, hash: string): Promise<{
+    warmAndSave(systemPrompt: string, hash: string, preferredSlotId?: number): Promise<{
         tokens: number;
         durationMs: number;
         bytes: number;
+        slotId: number;
     }>;
 }
 //# sourceMappingURL=base-cache.d.ts.map

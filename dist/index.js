@@ -32,6 +32,54 @@ function notifyUser(ctx, message, type = "info") {
         console.log(message);
     }
 }
+function isLlamaServerContext(ctx, config) {
+    const model = ctx?.model;
+    if (!model) {
+        return false;
+    }
+    // 1. Explicit local llama provider
+    if (model.provider === "local-llama") {
+        return true;
+    }
+    // 2. Cloud and remote providers that do not support llama.cpp slots
+    const nonLlamaProviders = [
+        "openai-codex",
+        "openai",
+        "azure-openai",
+        "anthropic",
+        "gemini",
+        "nvim",
+        "sakana",
+        "groq",
+        "cerebras",
+        "openrouter",
+        "deepseek",
+        "bedrock",
+        "ollama",
+        "ollama-gemma",
+        "ollama-lfm2",
+    ];
+    if (model.provider && nonLlamaProviders.includes(model.provider)) {
+        return false;
+    }
+    // 3. Match baseUrl host and port with configured llamaServerUrl
+    if (model.baseUrl) {
+        try {
+            const modelUrl = new URL(model.baseUrl);
+            const serverUrl = new URL(config.llamaServerUrl);
+            const isLoopback = (host) => host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0";
+            if (isLoopback(modelUrl.hostname) && isLoopback(serverUrl.hostname)) {
+                if (modelUrl.port === serverUrl.port || (!modelUrl.port && serverUrl.port === "80")) {
+                    return true;
+                }
+            }
+        }
+        catch {
+            // Ignore URL parse error
+        }
+    }
+    return false;
+}
 export default function piKvCacheManager(pi) {
     const config = loadConfig();
     const lru = new LruManager(config.cacheDir);
@@ -70,8 +118,14 @@ export default function piKvCacheManager(pi) {
         }
         return res.slotId;
     };
-    // Hook 0: Bind outgoing provider requests directly to the allocated slot
+    // Hook 0: Bind outgoing provider requests directly to the allocated slot (STRICTLY for llama-server)
     pi.on("before_provider_request", (event, ctx) => {
+        if (!isLlamaServerContext(ctx, config)) {
+            if (event.payload && typeof event.payload === "object") {
+                delete event.payload.id_slot;
+            }
+            return;
+        }
         const sessionId = ctx?.sessionManager?.getSessionId();
         const slotId = (sessionId && sessionSlots.get(sessionId)) ?? config.slotId;
         if (event.payload && typeof event.payload === "object") {
@@ -80,6 +134,13 @@ export default function piKvCacheManager(pi) {
     });
     // Hook 1: Session Start (Cold boot or resume)
     pi.on("session_start", async (_event, ctx) => {
+        if (!isLlamaServerContext(ctx, config)) {
+            try {
+                ctx.ui.setStatus(STATUS_KEY, undefined);
+            }
+            catch { }
+            return;
+        }
         try {
             await activateSessionSlot(ctx);
         }
@@ -89,6 +150,13 @@ export default function piKvCacheManager(pi) {
     });
     // Hook 1.5: Before Agent Start (Persistent RPC & subsequent turns slot verification)
     pi.on("before_agent_start", async (_event, ctx) => {
+        if (!isLlamaServerContext(ctx, config)) {
+            try {
+                ctx.ui.setStatus(STATUS_KEY, undefined);
+            }
+            catch { }
+            return;
+        }
         try {
             await activateSessionSlot(ctx);
         }
@@ -98,6 +166,9 @@ export default function piKvCacheManager(pi) {
     });
     // Hook 2: Turn End (Incremental lazy checkpointing)
     pi.on("turn_end", async (_event, ctx) => {
+        if (!isLlamaServerContext(ctx, config)) {
+            return;
+        }
         try {
             const sessionId = ctx.sessionManager?.getSessionId();
             if (!sessionId)
@@ -123,6 +194,23 @@ export default function piKvCacheManager(pi) {
         }
         catch (err) {
             console.warn(`[pi-kv-cache-manager] Error in turn_end handler:`, err);
+        }
+    });
+    // Hook 2.5: Model Select (Hide/show KV indicator dynamically when switching models)
+    pi.on("model_select", async (_event, ctx) => {
+        if (!isLlamaServerContext(ctx, config)) {
+            try {
+                ctx.ui.setStatus(STATUS_KEY, undefined);
+            }
+            catch { }
+        }
+        else {
+            try {
+                await activateSessionSlot(ctx);
+            }
+            catch (err) {
+                console.warn(`[pi-kv-cache-manager] Error in model_select slot activation:`, err);
+            }
         }
     });
     // Hook 3: Session Shutdown (Cleanup UI status)
@@ -199,6 +287,11 @@ export default function piKvCacheManager(pi) {
                     break;
                 }
                 case "save": {
+                    const curModel = ctx.model;
+                    if (!isLlamaServerContext(ctx, config)) {
+                        notifyUser(ctx, `⚠️ Current model (${curModel?.name || curModel?.id || "cloud"}) is not using local llama-server. KV slot snapshot is only available for local llama models.`, "warning");
+                        break;
+                    }
                     const customName = args[1];
                     const sessionId = ctx.sessionManager?.getSessionId() || "manual";
                     const slotId = sessionSlots.get(sessionId) ?? config.slotId;
@@ -237,6 +330,11 @@ export default function piKvCacheManager(pi) {
                     break;
                 }
                 case "restore": {
+                    const curModel = ctx.model;
+                    if (!isLlamaServerContext(ctx, config)) {
+                        notifyUser(ctx, `⚠️ Current model (${curModel?.name || curModel?.id || "cloud"}) is not using local llama-server. KV slot restore is only available for local llama models.`, "warning");
+                        break;
+                    }
                     const customName = args[1];
                     const sessionId = ctx.sessionManager?.getSessionId() || "manual";
                     const slotId = sessionSlots.get(sessionId) ?? config.slotId;
@@ -286,13 +384,13 @@ export default function piKvCacheManager(pi) {
                     const prompt = ctx.getSystemPrompt();
                     const hash = computeHash(prompt);
                     try {
-                        notifyUser(ctx, "Prefilling system prompt and skills into slot 0...", "info");
+                        notifyUser(ctx, "Prefilling system prompt and skills into an available slot...", "info");
                         const info = await baseCache.warmAndSave(prompt, hash);
                         try {
-                            ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(info.tokens)} 💾`);
+                            ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(info.tokens)} (S${info.slotId}) 💾`);
                         }
                         catch { }
-                        notifyUser(ctx, `✅ Golden Base cache refreshed: ${info.tokens.toLocaleString()} tokens (${LruManager.formatBytes(info.bytes)}) saved in ${info.durationMs.toFixed(1)}ms`, "info");
+                        notifyUser(ctx, `✅ Golden Base cache refreshed: ${info.tokens.toLocaleString()} tokens (${LruManager.formatBytes(info.bytes)}) saved into Slot ${info.slotId} in ${info.durationMs.toFixed(1)}ms`, "info");
                     }
                     catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
