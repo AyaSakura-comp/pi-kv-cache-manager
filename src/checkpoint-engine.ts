@@ -1,6 +1,15 @@
 import * as path from "node:path";
-import type { KvManagerConfig, LlamaSlotActionResponse, SnapshotMetadata } from "./types.js";
+import type { KvManagerConfig, LlamaSlotActionResponse, LlamaSlotInfo, SnapshotMetadata } from "./types.js";
 import { LruManager } from "./lru-manager.js";
+
+export async function fetchSlots(baseUrl: string): Promise<LlamaSlotInfo[]> {
+  const url = `${baseUrl.replace(/\/+$/, "")}/slots`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch slots from llama-server: HTTP ${res.status}`);
+  }
+  return (await res.json()) as LlamaSlotInfo[];
+}
 
 export function sanitizeFilename(name: string): string {
   // llama-server fs_validate_filename strictly disallows /, \, ..
@@ -95,6 +104,7 @@ export class CheckpointEngine {
     sessionId: string,
     sessionName: string | undefined,
     currentTokens: number,
+    slotId: number = this.config.slotId,
     onSuccess?: (info: { tokens: number; durationMs: number; bytes: number }) => void,
     onError?: (error: Error) => void
   ): Promise<boolean> {
@@ -128,7 +138,7 @@ export class CheckpointEngine {
       try {
         const resp = await saveSlot(
           this.config.llamaServerUrl,
-          this.config.slotId,
+          slotId,
           filename
         );
 

@@ -3,8 +3,9 @@ import * as fs from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
 import { LruManager } from "./lru-manager.js";
-import { CheckpointEngine, saveSlot, restoreSlot, sanitizeFilename } from "./checkpoint-engine.js";
+import { CheckpointEngine, saveSlot, restoreSlot, sanitizeFilename, fetchSlots } from "./checkpoint-engine.js";
 import { BaseCacheManager, BASE_SNAPSHOT_BIN, computeHash } from "./base-cache.js";
+import { SlotManager } from "./slot-manager.js";
 import type { KvManagerConfig } from "./types.js";
 
 const STATUS_KEY = "kv-cache";
@@ -42,83 +43,67 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
   const lru = new LruManager(config.cacheDir);
   const engine = new CheckpointEngine(config, lru);
   const baseCache = new BaseCacheManager(config, lru);
+  const slotManager = new SlotManager(config, lru, engine, baseCache);
 
-  // Hook 0: Bind requests directly to the managed slot
-  pi.on("before_provider_request", (event) => {
+  const sessionSlots = new Map<string, number>();
+
+  const activateSessionSlot = async (ctx: ExtensionContext): Promise<number> => {
+    const sessionId = ctx.sessionManager?.getSessionId();
+    if (!sessionId) return config.slotId;
+
+    const systemPrompt = typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : undefined;
+    const res = await slotManager.ensureSlotForSession(sessionId, systemPrompt);
+    sessionSlots.set(sessionId, res.slotId);
+
+    if (res.restored) {
+      const label = res.isBase ? `Base ${formatTokens(res.tokens ?? 0)}` : formatTokens(res.tokens ?? 0);
+      try {
+        if (ctx.hasUI) {
+          ctx.ui.setStatus(STATUS_KEY, `KV: ${label} (S${res.slotId}) ⚡`);
+          ctx.ui.notify(
+            `Restored KV cache to slot ${res.slotId}: ${(res.tokens ?? 0).toLocaleString()} tokens in ${(res.durationMs || 0).toFixed(1)}ms (⚡ instant resume)`,
+            "info"
+          );
+        }
+      } catch {
+        // UI unavailable
+      }
+    } else if (res.hit) {
+      try {
+        if (ctx.hasUI) {
+          ctx.ui.setStatus(STATUS_KEY, `KV: Warm (S${res.slotId}) ⚡`);
+        }
+      } catch {
+        // UI unavailable
+      }
+    }
+    return res.slotId;
+  };
+
+  // Hook 0: Bind outgoing provider requests directly to the allocated slot
+  pi.on("before_provider_request", (event, ctx: ExtensionContext) => {
+    const sessionId = ctx?.sessionManager?.getSessionId();
+    const slotId = (sessionId && sessionSlots.get(sessionId)) ?? config.slotId;
     if (event.payload && typeof event.payload === "object") {
-      (event.payload as Record<string, unknown>).id_slot = config.slotId;
+      (event.payload as Record<string, unknown>).id_slot = slotId;
     }
   });
 
   // Hook 1: Session Start (Cold boot or resume)
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
     try {
-      const sessionId = ctx.sessionManager?.getSessionId();
-      if (!sessionId) return;
-
-      const snapFilename = engine.getSnapshotFilename(sessionId);
-      const snapPath = path.join(config.cacheDir, snapFilename);
-
-      let resumed = false;
-      try {
-        await fs.access(snapPath);
-        resumed = true;
-      } catch {
-        resumed = false;
-      }
-
-      if (resumed) {
-        // Case A: Existing session resumption
-        try {
-          const resp = await restoreSlot(config.llamaServerUrl, config.slotId, snapFilename);
-          await lru.touchSnapshot(snapFilename);
-          const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
-          const restoreMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
-          engine.setSavedTokens(sessionId, tokens);
-
-          ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} ⚡`);
-          ctx.ui.notify(
-            `Restored KV cache: ${tokens.toLocaleString()} tokens in ${restoreMs.toFixed(1)}ms (⚡ instant resume)`,
-            "info"
-          );
-          return;
-        } catch (err) {
-          console.warn(`[pi-kv-cache-manager] Failed to restore session snapshot:`, err);
-        }
-      }
-
-      // Case B: Brand new session - check Golden Base cache
-      if (config.enableBaseCache && typeof ctx.getSystemPrompt === "function") {
-        const systemPrompt = ctx.getSystemPrompt();
-        if (systemPrompt && systemPrompt.length > 0) {
-          const res = await baseCache.checkAndRestore(systemPrompt);
-
-          if (res.status === "hit") {
-            ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(res.tokens ?? 0)} ⚡`);
-            ctx.ui.notify(
-              `Restored Golden Base KV: ${res.tokens?.toLocaleString()} tokens in ${res.durationMs?.toFixed(1) || 0}ms (⚡ instant boot)`,
-              "info"
-            );
-          } else if (res.status === "miss") {
-            // Background pre-warm and snapshot Golden Base for future sessions
-            baseCache.warmAndSave(systemPrompt, res.hash).then((warmInfo) => {
-              try {
-                ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(warmInfo.tokens)} 💾`);
-                ctx.ui.notify(
-                  `Created Golden Base KV cache: ${warmInfo.tokens.toLocaleString()} tokens saved for instant future boots.`,
-                  "info"
-                );
-              } catch {
-                // Ignore stale context if session switched
-              }
-            }).catch((err) => {
-              console.warn(`[pi-kv-cache-manager] Failed to warm base cache:`, err);
-            });
-          }
-        }
-      }
+      await activateSessionSlot(ctx);
     } catch (err) {
       console.warn(`[pi-kv-cache-manager] Error in session_start handler:`, err);
+    }
+  });
+
+  // Hook 1.5: Before Agent Start (Persistent RPC & subsequent turns slot verification)
+  pi.on("before_agent_start", async (_event, ctx: ExtensionContext) => {
+    try {
+      await activateSessionSlot(ctx);
+    } catch (err) {
+      console.warn(`[pi-kv-cache-manager] Error in before_agent_start handler:`, err);
     }
   });
 
@@ -127,6 +112,7 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
     try {
       const sessionId = ctx.sessionManager?.getSessionId();
       if (!sessionId) return;
+      const slotId = sessionSlots.get(sessionId) ?? config.slotId;
 
       const usage = ctx.getContextUsage?.();
       const currentTokens = usage?.tokens || 0;
@@ -136,10 +122,11 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
         sessionId,
         sessionName,
         currentTokens,
+        slotId,
         (info) => {
           try {
             if (ctx.hasUI) {
-              ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(info.tokens)} 💾`);
+              ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(info.tokens)} (S${slotId}) 💾`);
             }
           } catch {
             // Ignore stale context if print mode or session exited
@@ -188,12 +175,13 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
           const usage = ctx.getContextUsage?.();
           const activeTokens = usage?.tokens ?? 0;
           const sessionId = ctx.sessionManager?.getSessionId() || "unknown";
+          const currentSlot = sessionSlots.get(sessionId) ?? config.slotId;
           const lastSavedTokens = engine.getSavedTokens(sessionId);
 
           const lines: string[] = [
             "### ⚡ Pi KV Cache Manager Status",
             "",
-            `- **Llama Server**: \`${config.llamaServerUrl}\` (Slot: \`${config.slotId}\`)`,
+            `- **Llama Server**: \`${config.llamaServerUrl}\` (Active Slot: \`${currentSlot}\`)`,
             `- **Cache Storage Root**: \`${config.cacheDir}\``,
             `- **Disk Usage**: **${LruManager.formatBytes(totalBytes)}** / ${config.maxDiskUsageGb} GB (${snapshots.length} total snapshots)`,
             `- **Session Snapshots**: ${sessionSnaps.length} / ${config.maxSessions} max`,
@@ -203,6 +191,22 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
             `- **Golden Base Cache**: ${baseSnap ? `✅ ${baseSnap.meta.tokenCount.toLocaleString()} tokens (${LruManager.formatBytes(baseSnap.meta.fileSizeBytes)})` : "❌ None"}`,
             "",
           ];
+
+          try {
+            const liveSlots = await fetchSlots(config.llamaServerUrl);
+            lines.push("#### Live Server Slots:");
+            lines.push("| Slot ID | Status | Active Snapshot | Last Used |");
+            lines.push("| :---: | :---: | :--- | :---: |");
+            for (const ls of liveSlots) {
+              const status = ls.is_processing ? "🔄 Busy" : "💤 Idle";
+              const snap = ls.snapshot_filename || "(empty)";
+              const lu = ls.t_last_used && ls.t_last_used > 0 ? new Date(ls.t_last_used / 1000).toLocaleTimeString() : "-";
+              lines.push(`| ${ls.id} | ${status} | \`${snap}\` | ${lu} |`);
+            }
+            lines.push("");
+          } catch {
+            // Live slots fetch is best-effort
+          }
 
           if (sessionSnaps.length > 0) {
             lines.push("#### Stored Sessions:");
@@ -223,13 +227,14 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
         case "save": {
           const customName = args[1];
           const sessionId = ctx.sessionManager?.getSessionId() || "manual";
+          const slotId = sessionSlots.get(sessionId) ?? config.slotId;
           const filename = customName
             ? `snap_${sanitizeFilename(customName)}.bin`
             : engine.getSnapshotFilename(sessionId);
 
           try {
-            notifyUser(ctx, `Saving KV snapshot to \`${filename}\`...`, "info");
-            const resp = await saveSlot(config.llamaServerUrl, config.slotId, filename);
+            notifyUser(ctx, `Saving KV snapshot (Slot ${slotId}) to \`${filename}\`...`, "info");
+            const resp = await saveSlot(config.llamaServerUrl, slotId, filename);
             const tokens = resp.n_saved ?? resp.n_tokens ?? 0;
             const bytes = resp.n_written ?? resp.n_bytes ?? 0;
             const saveMs = resp.timings?.save_ms ?? resp.t_ms ?? 0;
@@ -248,7 +253,7 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
             });
 
             await lru.enforceLRU(config);
-            try { ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} 💾`); } catch {}
+            try { ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} (S${slotId}) 💾`); } catch {}
             notifyUser(
               ctx,
               `✅ Successfully saved ${tokens.toLocaleString()} tokens (${LruManager.formatBytes(bytes)}) in ${saveMs.toFixed(1)}ms`,
@@ -264,19 +269,20 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
         case "restore": {
           const customName = args[1];
           const sessionId = ctx.sessionManager?.getSessionId() || "manual";
+          const slotId = sessionSlots.get(sessionId) ?? config.slotId;
           const filename = customName
             ? (customName.endsWith(".bin") ? customName : `snap_${sanitizeFilename(customName)}.bin`)
             : engine.getSnapshotFilename(sessionId);
 
           try {
-            notifyUser(ctx, `Restoring KV snapshot from \`${filename}\`...`, "info");
-            const resp = await restoreSlot(config.llamaServerUrl, config.slotId, filename);
+            notifyUser(ctx, `Restoring KV snapshot (Slot ${slotId}) from \`${filename}\`...`, "info");
+            const resp = await restoreSlot(config.llamaServerUrl, slotId, filename);
             await lru.touchSnapshot(filename);
             const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
             const restoreMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
             engine.setSavedTokens(sessionId, tokens);
 
-            try { ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} ⚡`); } catch {}
+            try { ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(tokens)} (S${slotId}) ⚡`); } catch {}
             notifyUser(
               ctx,
               `✅ Successfully restored ${tokens.toLocaleString()} tokens in ${restoreMs.toFixed(1)}ms`,

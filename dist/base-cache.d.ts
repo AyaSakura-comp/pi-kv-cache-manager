@@ -21,7 +21,7 @@ export declare class BaseCacheManager {
      * Checks whether the current system prompt matches the cached golden base snapshot.
      * If matched, restores it instantly into the slot (~20ms).
      */
-    checkAndRestore(systemPrompt: string): Promise<BaseCacheRestoreResult>;
+    checkAndRestore(systemPrompt: string, slotId?: number): Promise<BaseCacheRestoreResult>;
     /**
      * Warms the base prompt by sending an evaluation request with n_predict=0,
      * then snapshots the resulting KV cache to disk as base_system_prompt.bin.

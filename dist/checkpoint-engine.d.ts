@@ -1,5 +1,6 @@
-import type { KvManagerConfig, LlamaSlotActionResponse } from "./types.js";
+import type { KvManagerConfig, LlamaSlotActionResponse, LlamaSlotInfo } from "./types.js";
 import { LruManager } from "./lru-manager.js";
+export declare function fetchSlots(baseUrl: string): Promise<LlamaSlotInfo[]>;
 export declare function sanitizeFilename(name: string): string;
 export declare function saveSlot(baseUrl: string, slotId: number, filename: string): Promise<LlamaSlotActionResponse>;
 export declare function restoreSlot(baseUrl: string, slotId: number, filename: string): Promise<LlamaSlotActionResponse>;
@@ -18,7 +19,7 @@ export declare class CheckpointEngine {
      * Evaluates token progress after a turn and executes an asynchronous,
      * non-blocking snapshot save if threshold conditions are met.
      */
-    maybeCheckpoint(sessionId: string, sessionName: string | undefined, currentTokens: number, onSuccess?: (info: {
+    maybeCheckpoint(sessionId: string, sessionName: string | undefined, currentTokens: number, slotId?: number, onSuccess?: (info: {
         tokens: number;
         durationMs: number;
         bytes: number;

@@ -1,4 +1,12 @@
 import * as path from "node:path";
+export async function fetchSlots(baseUrl) {
+    const url = `${baseUrl.replace(/\/+$/, "")}/slots`;
+    const res = await fetch(url);
+    if (!res.ok) {
+        throw new Error(`Failed to fetch slots from llama-server: HTTP ${res.status}`);
+    }
+    return (await res.json());
+}
 export function sanitizeFilename(name) {
     // llama-server fs_validate_filename strictly disallows /, \, ..
     return name.replace(/[^a-zA-Z0-9_\-\.]/g, "_");
@@ -68,7 +76,7 @@ export class CheckpointEngine {
      * Evaluates token progress after a turn and executes an asynchronous,
      * non-blocking snapshot save if threshold conditions are met.
      */
-    async maybeCheckpoint(sessionId, sessionName, currentTokens, onSuccess, onError) {
+    async maybeCheckpoint(sessionId, sessionName, currentTokens, slotId = this.config.slotId, onSuccess, onError) {
         if (!this.config.enableIncrementalSave) {
             return false;
         }
@@ -90,7 +98,7 @@ export class CheckpointEngine {
             const metaFilename = filename.replace(/\.bin$/, ".meta.json");
             const metaPath = path.join(this.config.cacheDir, metaFilename);
             try {
-                const resp = await saveSlot(this.config.llamaServerUrl, this.config.slotId, filename);
+                const resp = await saveSlot(this.config.llamaServerUrl, slotId, filename);
                 const savedTokens = resp.n_saved ?? resp.n_tokens ?? currentTokens;
                 const savedBytes = resp.n_written ?? resp.n_bytes ?? 0;
                 const saveMs = resp.timings?.save_ms ?? resp.t_ms ?? 0;

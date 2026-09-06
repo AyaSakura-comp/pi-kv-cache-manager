@@ -45,7 +45,7 @@ export class BaseCacheManager {
    * Checks whether the current system prompt matches the cached golden base snapshot.
    * If matched, restores it instantly into the slot (~20ms).
    */
-  async checkAndRestore(systemPrompt: string): Promise<BaseCacheRestoreResult> {
+  async checkAndRestore(systemPrompt: string, slotId: number = this.config.slotId): Promise<BaseCacheRestoreResult> {
     if (!this.config.enableBaseCache) {
       return { status: "disabled", hash: "" };
     }
@@ -67,7 +67,7 @@ export class BaseCacheManager {
     try {
       const resp = await restoreSlot(
         this.config.llamaServerUrl,
-        this.config.slotId,
+        slotId,
         BASE_SNAPSHOT_BIN
       );
 

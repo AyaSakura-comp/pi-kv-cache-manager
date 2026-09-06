@@ -62,4 +62,13 @@ export interface CacheStatusReport {
     activeSessionTokens?: number;
     lastAction?: string;
 }
+export interface LlamaSlotInfo {
+    id: number;
+    n_ctx: number;
+    speculative?: boolean;
+    is_processing: boolean;
+    snapshot_filename?: string;
+    t_last_used?: number;
+    id_task?: number;
+}
 //# sourceMappingURL=types.d.ts.map
