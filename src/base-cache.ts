@@ -9,10 +9,21 @@ export const BASE_SNAPSHOT_BIN = "base_system_prompt.bin";
 export const BASE_SNAPSHOT_META = "base_system_prompt.meta.json";
 export const BASE_TOOLS_JSON = "base_tools.json";
 
+function stableStringify(obj: unknown): string {
+  if (obj === null || typeof obj !== "object") {
+    return JSON.stringify(obj);
+  }
+  if (Array.isArray(obj)) {
+    return "[" + obj.map(stableStringify).join(",") + "]";
+  }
+  const keys = Object.keys(obj as Record<string, unknown>).sort();
+  return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify((obj as Record<string, unknown>)[k])).join(",") + "}";
+}
+
 export function computeHash(content: string, tools?: unknown[]): string {
   const h = crypto.createHash("sha256").update(content, "utf-8");
   if (tools && Array.isArray(tools) && tools.length > 0) {
-    h.update(JSON.stringify(tools), "utf-8");
+    h.update(stableStringify(tools), "utf-8");
   }
   return h.digest("hex");
 }

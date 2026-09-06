@@ -163,6 +163,14 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
     const slotId = await activateSessionSlot(ctx, systemPrompt, tools);
     if (event.payload && typeof event.payload === "object") {
       (event.payload as Record<string, unknown>).id_slot = slotId;
+
+      // Ensure preserve_thinking is set so subsequent turns retain assistant thinking blocks in KV cache!
+      const currentKwargs =
+        ((event.payload as Record<string, unknown>).chat_template_kwargs as Record<string, unknown>) || {};
+      (event.payload as Record<string, unknown>).chat_template_kwargs = {
+        ...currentKwargs,
+        preserve_thinking: true,
+      };
     }
   });
 

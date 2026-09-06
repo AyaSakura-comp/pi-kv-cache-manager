@@ -92,50 +92,47 @@ export class CheckpointEngine {
             return false;
         }
         this.inFlightSaves.add(sessionId);
-        // Run async checkpoint in background so the UI and agent loop are never stalled
-        (async () => {
-            const filename = this.getSnapshotFilename(sessionId);
-            const metaFilename = filename.replace(/\.bin$/, ".meta.json");
-            const metaPath = path.join(this.config.cacheDir, metaFilename);
-            try {
-                const resp = await saveSlot(this.config.llamaServerUrl, slotId, filename);
-                const savedTokens = resp.n_saved ?? resp.n_tokens ?? currentTokens;
-                const savedBytes = resp.n_written ?? resp.n_bytes ?? 0;
-                const saveMs = resp.timings?.save_ms ?? resp.t_ms ?? 0;
-                this.sessionSavedTokens.set(sessionId, savedTokens);
-                const existingMeta = await this.lru.readMetadata(metaPath);
-                const now = new Date().toISOString();
-                const meta = {
-                    sessionId,
-                    sessionName,
-                    tokenCount: savedTokens,
-                    fileSizeBytes: savedBytes,
-                    createdAt: existingMeta?.createdAt || now,
-                    lastAccessedAt: now,
-                    promptPrefixHash: existingMeta?.promptPrefixHash || "",
-                    isBaseSnapshot: false,
-                };
-                await this.lru.writeMetadata(metaPath, meta);
-                // Run LRU check to maintain session quota
-                await this.lru.enforceLRU(this.config);
-                if (onSuccess) {
-                    onSuccess({
-                        tokens: savedTokens,
-                        durationMs: saveMs,
-                        bytes: savedBytes,
-                    });
-                }
+        const filename = this.getSnapshotFilename(sessionId);
+        const metaFilename = filename.replace(/\.bin$/, ".meta.json");
+        const metaPath = path.join(this.config.cacheDir, metaFilename);
+        try {
+            const resp = await saveSlot(this.config.llamaServerUrl, slotId, filename);
+            const savedTokens = resp.n_saved ?? resp.n_tokens ?? currentTokens;
+            const savedBytes = resp.n_written ?? resp.n_bytes ?? 0;
+            const saveMs = resp.timings?.save_ms ?? resp.t_ms ?? 0;
+            this.sessionSavedTokens.set(sessionId, savedTokens);
+            const existingMeta = await this.lru.readMetadata(metaPath);
+            const now = new Date().toISOString();
+            const meta = {
+                sessionId,
+                sessionName,
+                tokenCount: savedTokens,
+                fileSizeBytes: savedBytes,
+                createdAt: existingMeta?.createdAt || now,
+                lastAccessedAt: now,
+                promptPrefixHash: existingMeta?.promptPrefixHash || "",
+                isBaseSnapshot: false,
+            };
+            await this.lru.writeMetadata(metaPath, meta);
+            // Run LRU check to maintain session quota
+            await this.lru.enforceLRU(this.config);
+            if (onSuccess) {
+                onSuccess({
+                    tokens: savedTokens,
+                    durationMs: saveMs,
+                    bytes: savedBytes,
+                });
             }
-            catch (err) {
-                const error = err instanceof Error ? err : new Error(String(err));
-                console.error(`[pi-kv-cache-manager] Checkpoint error for ${sessionId}:`, error);
-                if (onError)
-                    onError(error);
-            }
-            finally {
-                this.inFlightSaves.delete(sessionId);
-            }
-        })();
+        }
+        catch (err) {
+            const error = err instanceof Error ? err : new Error(String(err));
+            console.error(`[pi-kv-cache-manager] Checkpoint error for ${sessionId}:`, error);
+            if (onError)
+                onError(error);
+        }
+        finally {
+            this.inFlightSaves.delete(sessionId);
+        }
         return true;
     }
 }

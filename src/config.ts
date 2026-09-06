@@ -11,8 +11,8 @@ export const DEFAULT_CONFIG: KvManagerConfig = {
   cacheDir: process.env.LLAMA_SLOT_SAVE_PATH || DEFAULT_CACHE_DIR,
   maxSessions: 30,
   maxDiskUsageGb: 40,
-  minTokensThreshold: 3000,
-  stepTokensIncrement: 3000,
+  minTokensThreshold: 1000,
+  stepTokensIncrement: 0,
   enableBaseCache: true,
   enableIncrementalSave: true,
 };

@@ -76,11 +76,15 @@ export class SlotManager {
       if (activeSid === sessionId) {
         const live = slots.find((s) => s.id === slotId);
         if (live) {
-          return {
-            slotId,
-            hit: true,
-            restored: false,
-          };
+          if (live.snapshot_filename && live.snapshot_filename !== snapFilename) {
+            this.activeSlotSessions.delete(slotId);
+          } else {
+            return {
+              slotId,
+              hit: true,
+              restored: false,
+            };
+          }
         }
       }
     }
@@ -118,6 +122,7 @@ export class SlotManager {
     }
 
     const targetSlotId = chosenSlot ? chosenSlot.id : this.config.slotId;
+    this.activeSlotSessions.delete(targetSlotId);
 
     // 3. Restore session snapshot from disk if available
     const snapPath = path.join(this.config.cacheDir, snapFilename);
@@ -143,6 +148,14 @@ export class SlotManager {
         restored: true,
         tokens,
         durationMs,
+      };
+    }
+
+    if (!snapExists && tools === undefined) {
+      return {
+        slotId: targetSlotId,
+        hit: false,
+        restored: false,
       };
     }
 

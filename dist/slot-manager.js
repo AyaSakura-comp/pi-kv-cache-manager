@@ -46,11 +46,16 @@ export class SlotManager {
             if (activeSid === sessionId) {
                 const live = slots.find((s) => s.id === slotId);
                 if (live) {
-                    return {
-                        slotId,
-                        hit: true,
-                        restored: false,
-                    };
+                    if (live.snapshot_filename && live.snapshot_filename !== snapFilename) {
+                        this.activeSlotSessions.delete(slotId);
+                    }
+                    else {
+                        return {
+                            slotId,
+                            hit: true,
+                            restored: false,
+                        };
+                    }
                 }
             }
         }
@@ -80,6 +85,7 @@ export class SlotManager {
             chosenSlot = [...candidates].sort((a, b) => (a.t_last_used ?? 0) - (b.t_last_used ?? 0))[0];
         }
         const targetSlotId = chosenSlot ? chosenSlot.id : this.config.slotId;
+        this.activeSlotSessions.delete(targetSlotId);
         // 3. Restore session snapshot from disk if available
         const snapPath = path.join(this.config.cacheDir, snapFilename);
         let snapExists = false;
@@ -103,6 +109,13 @@ export class SlotManager {
                 restored: true,
                 tokens,
                 durationMs,
+            };
+        }
+        if (!snapExists && tools === undefined) {
+            return {
+                slotId: targetSlotId,
+                hit: false,
+                restored: false,
             };
         }
         // 4. If new session (no snapshot on disk), check Golden Base Cache

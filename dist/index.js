@@ -135,6 +135,12 @@ export default function piKvCacheManager(pi) {
         const slotId = await activateSessionSlot(ctx, systemPrompt, tools);
         if (event.payload && typeof event.payload === "object") {
             event.payload.id_slot = slotId;
+            // Ensure preserve_thinking is set so subsequent turns retain assistant thinking blocks in KV cache!
+            const currentKwargs = event.payload.chat_template_kwargs || {};
+            event.payload.chat_template_kwargs = {
+                ...currentKwargs,
+                preserve_thinking: true,
+            };
         }
     });
     // Hook 1: Session Start (Cold boot or resume)
