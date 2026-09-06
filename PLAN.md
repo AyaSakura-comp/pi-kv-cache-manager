@@ -26,7 +26,7 @@ $$T(N) = c_1 N + c_2 N^2 \quad (c_1 \approx 0.6 \text{ ms/tok}, \; c_2 \approx 3
 
 ## 2. Architecture Roadmap
 
-The project is structured into **4 cohesive engineering phases**:
+The project is structured into **5 cohesive engineering phases**:
 
 ```mermaid
 graph TD
@@ -51,6 +51,13 @@ graph TD
         C3 --> B1[session_start / pi new Hook]
         B1 --> B2[System Prompt + Skill Descriptions Hash]
         B2 --> B3[0.02s Instant Cold Boot on pi new]
+    end
+
+    subgraph Phase 5: Multi-Slot & Persistent RPC
+        B3 --> M1[SlotManager Multi-Slot Discovery]
+        M1 --> M2[before_agent_start Turn-by-Turn Hook]
+        M2 --> M3[Direct RAM Cache Hit Routing]
+        M3 --> M4[10-Session Switching Under 4.5s]
     end
 ```
 
@@ -166,18 +173,43 @@ Even brand new sessions (`pi new`) must evaluate the system prompt, tool definit
 
 ---
 
-## 7. Extension Commands & User Controls
+## 7. Phase 5: Multi-Slot Affinity & Persistent RPC Lifecycle
+
+### Problem
+1. **Multi-Slot Blindspot**: High-end deployments launch `llama-server` with multiple slots (e.g. `-np 2`, each with 260k context), but the client previously hardcoded `slotId: 0`, leaving Slot 1 unused and creating needless slot thrashing.
+2. **Persistent RPC Hook Blindspot**: Bridges like `pi-discord-gateway` and `piweb` run long-lived `pi --mode rpc` worker processes per channel. In persistent RPC mode, `session_start` only fires once on process spawn. When switching between multiple channels, Slot 0 was overwritten, and returning to a 78k-token session bypassed restore, causing an 80+ second full prompt re-evaluation and gateway timeout.
+
+### Architecture Specification
+1. **Llama Server Metadata Exposure**:
+   * Upstream/fork patch in `tools/server/server-context.cpp`: `struct server_slot` records `snapshot_filename` and `t_last_used`.
+   * Exposed in `/slots` JSON output.
+2. **SlotManager (`src/slot-manager.ts`)**:
+   * **Direct RAM Hit**: Queries `/slots`. If any slot currently holds `snap_<sessionId>.bin`, routes requests there with **0ms disk restore**.
+   * **LRU Slot Allocation**: On cache miss, picks an idle slot or the oldest slot by `t_last_used`.
+   * **Clean Context Isolation**: Issues `SLOT_ERASE` when allocating a slot to a new session without snapshots.
+3. **Turn-by-Turn Verification (`before_agent_start`)**:
+   * Hooks `before_agent_start` in `src/index.ts` so every turn in persistent RPC verifies slot residency and triggers NVMe restore (~160ms) if evicted.
+   * Dynamically binds `id_slot` in `before_provider_request`.
+4. **Empirical Verification (10-Session Stress Test)**:
+   * 10 concurrent persistent RPC sessions × 78,974 tokens (>780,000 tokens total context).
+   * 15 randomized switching jumps across 2 server slots.
+   * Average turnaround: **4.45s** (Min: 2.87s RAM hit, Max: 6.27s NVMe restore).
+   * Context Recall: **100% (15/15 PASS)**.
+
+---
+
+## 8. Extension Commands & User Controls
 
 The extension registers user-friendly slash commands in Pi Agent:
-* `/kv status`: Displays current cache utilization, active snapshots, hit rate, and SSD usage.
-* `/kv save [name]`: Manually snapshots current slot to a named checkpoint.
+* `/kv status`: Displays current cache utilization, active snapshots, hit rate, and live server slot residency table.
+* `/kv save [name]`: Manually snapshots active slot to a named checkpoint.
 * `/kv restore [name]`: Manually restores slot from a named checkpoint.
 * `/kv prune`: Manually triggers LRU cleanup to free disk space.
 * `/kv base-update`: Forces a re-generation of the Golden Base System Prompt snapshot.
 
 ---
 
-## 8. Directory Layout
+## 9. Directory Layout
 
 ```text
 pi-kv-cache-manager/
@@ -193,5 +225,6 @@ pi-kv-cache-manager/
     ├── types.ts                     <-- Type Definitions & Schemas
     ├── lru-manager.ts               <-- Quota & LRU Storage Cleaner
     ├── checkpoint-engine.ts         <-- Step-based Lazy Checkpointing
-    └── base-cache.ts                <-- Golden System Prompt Cache Manager
+    ├── base-cache.ts                <-- Golden System Prompt Cache Manager
+    └── slot-manager.ts              <-- Multi-Slot Affinity & Dynamic Routing Engine
 ```

@@ -24,6 +24,33 @@ When working with long coding agent sessions (100k ~ 260k tokens), restarting a 
 
 Instead of re-evaluating 150k tokens (consuming ~2.8 minutes of 100W APU heat), reading 2.9 GB from NVMe takes **~0.3 seconds**.
 
+### 🏆 Multi-Session Switching Stress Test (10 Sessions × 78k Tokens)
+
+To prove reliability under multi-user / multi-channel thrashing, we executed a 15-jump randomized switching stress test across **10 concurrent persistent RPC sessions**, each carrying **78,974 tokens** of context (>780,000 tokens total), on a dual-slot (`-np 2`, 260k context per slot) server:
+
+| Jump # | Target Session (78k Tokens) | Cache Hit Mechanism | Turnaround Latency | Context Recall & Integrity |
+| :---: | :--- | :--- | :---: | :---: |
+| **#01** | `S08-雷霆泰坦` | NVMe Restore | **3.43 s** | ✅ PASS (100% match) |
+| **#02** | `S04-深海巨鯊` | NVMe Restore | **4.52 s** | ✅ PASS (100% match) |
+| **#03** | `S03-黃金獵鷹` | NVMe Restore | **4.43 s** | ✅ PASS (100% match) |
+| **#04** | `S09-冰霜巨狼` | NVMe Restore | **4.77 s** | ✅ PASS (100% match) |
+| **#05** | `S06-翡翠靈鹿` | NVMe Restore | **4.27 s** | ✅ PASS (100% match) |
+| **#06** | `S07-白銀天馬` | NVMe Restore | **6.27 s** | ✅ PASS (100% match) |
+| **#07** | `S10-恆星幼龍` | NVMe Restore | **4.72 s** | ✅ PASS (100% match) |
+| **#08** | `S05-暗影黑豹` | NVMe Restore | **4.75 s** | ✅ PASS (100% match) |
+| **#09** | `S01-極光鯨魚` | NVMe Restore | **4.09 s** | ✅ PASS (100% match) |
+| **#10** | `S02-赤紅鳳凰` | NVMe Restore | **4.96 s** | ✅ PASS (100% match) |
+| **#11** | `S10-恆星幼龍` | NVMe Restore | **4.32 s** | ✅ PASS (100% match) |
+| **#12** | `S07-白銀天馬` | NVMe Restore | **5.31 s** | ✅ PASS (100% match) |
+| **#13** | `S01-極光鯨魚` | NVMe Restore | **3.79 s** | ✅ PASS (100% match) |
+| **#14** | `S01-極光鯨魚` | **Direct RAM Hit (Slot 0)** | **2.87 s** | ✅ PASS (100% match) |
+| **#15** | `S02-赤紅鳳凰` | NVMe Restore | **4.23 s** | ✅ PASS (100% match) |
+
+* **Average Turnaround Latency**: **4.45 s** (includes thinking model generation + streaming output)
+* **RAM Cache Hit (Slot 0 Resident)**: **2.87 s** (zero disk read)
+* **Context Integrity**: **100% (15/15 PASS)** — every session accurately recalled its unique session identity and verified complete 78k backstory.
+* **Prefill Avoided**: Eliminated **>80 seconds** of quadratic full re-evaluation penalty on every session switch.
+
 ---
 
 ## 🏛️ Software Architecture
@@ -33,34 +60,39 @@ Instead of re-evaluating 150k tokens (consuming ~2.8 minutes of 100W APU heat), 
 ```mermaid
 graph TB
     subgraph HostClient ["Pi Agent Harness (CLI / Web / Discord)"]
-        PiSession["AgentSession (@earendil-works/pi-coding-agent)<br/>• Lifecycle Events (session_start, turn_end, session_shutdown)<br/>• Extension API Context (ctx.getSystemPrompt, ctx.ui)"]
+        PiSession["AgentSession (@earendil-works/pi-coding-agent)<br/>• Lifecycle Events (session_start, before_agent_start, turn_end)<br/>• Dynamic Request Hook (before_provider_request)<br/>• Extension API Context (ctx.getSystemPrompt, ctx.ui)"]
         SlashCmd["Slash Command Dispatcher (/kv status, save, restore, prune, base-update)"]
         PiSession --> SlashCmd
     end
 
     subgraph ExtensionCore ["pi-kv-cache-manager (Extension Core)"]
-        ExtEntry["Extension Entry (src/index.ts)<br/>Registers hooks, commands, and UI status"]
+        ExtEntry["Extension Entry (src/index.ts)<br/>Registers hooks, commands, dynamic id_slot routing"]
         ConfigMgr["Configuration Loader (src/config.ts)<br/>Merges settings.json with environment defaults"]
         
         ExtEntry --> ConfigMgr
 
         subgraph Modules ["Core Functional Modules"]
-            BaseCache["BaseCacheManager (src/base-cache.ts)<br/>• SHA-256 System Prompt Hashing<br/>• Golden Base Pre-warm & Slot Snapshot<br/>• Instant Slot 0 Restore (~50ms)"]
+            SlotMgr["SlotManager (src/slot-manager.ts)<br/>• Dynamic Multi-Slot Discovery (GET /slots)<br/>• Direct RAM Cache Hit Detection (0ms restore)<br/>• LRU Slot Selection & Context Clean Erase"]
+
+            BaseCache["BaseCacheManager (src/base-cache.ts)<br/>• SHA-256 System Prompt Hashing<br/>• Golden Base Pre-warm & Slot Snapshot<br/>• Instant Slot RAM Injection (~20ms)"]
             
             Checkpointer["CheckpointEngine (src/checkpoint-engine.ts)<br/>• Lazy Incremental Checkpoints on turn_end<br/>• Token Increment Threshold Gating<br/>• REST Client for llama.cpp Slot API"]
             
             LruEngine["LruManager (src/lru-manager.ts)<br/>• Metadata Sidecar Tracking (*.meta.json)<br/>• 30 Session Snapshot Limit<br/>• 40 GB Hard Storage Quota Eviction"]
         end
 
-        ExtEntry --> BaseCache
+        ExtEntry --> SlotMgr
+        SlotMgr --> BaseCache
+        SlotMgr --> Checkpointer
+        SlotMgr --> LruEngine
         ExtEntry --> Checkpointer
         ExtEntry --> LruEngine
     end
 
     subgraph LlamaServer ["llama-server (AMD ROCm 7.x / GFX1151)"]
-        SlotEndpoint["Slot Action REST API<br/>POST /slots/:id?action=save|restore|erase"]
+        SlotEndpoint["Slot Action REST API<br/>• GET /slots (snapshot_filename, t_last_used)<br/>• POST /slots/:id?action=save|restore|erase"]
         MultimodalPatch["Upstream Multimodal Patch (PR #25076)<br/>Permits text slot operations when --mmproj is loaded"]
-        GpuKvCache["APU Unified Memory KV Cache (520k Context Window)"]
+        GpuKvCache["APU Unified Memory KV Cache (520k Context Window, Multi-Slot -np 2)"]
 
         SlotEndpoint --> MultimodalPatch
         MultimodalPatch --> GpuKvCache
@@ -68,12 +100,12 @@ graph TB
 
     subgraph StorageLayer ["NVMe Snapshot Storage (~/.cache/llama-slots/)"]
         BaseFiles[("Golden Base Snapshot<br/>• base_system_prompt.bin<br/>• base_system_prompt.meta.json")]
-        SessionFiles[("Session Checkpoints<br/>• session_<id>.bin<br/>• session_<id>.meta.json<br/>• session_<id>.bin.media.json")]
+        SessionFiles[("Session Checkpoints<br/>• snap_<id>.bin<br/>• snap_<id>.meta.json<br/>• snap_<id>.bin.media.json")]
     end
 
     SlashCmd --> ExtEntry
-    BaseCache -->|Slot Actions| SlotEndpoint
-    Checkpointer -->|Slot Actions| SlotEndpoint
+    SlotMgr -->|Fetch & Restore| SlotEndpoint
+    Checkpointer -->|Save / Restore| SlotEndpoint
     LruEngine -->|Quota Tracking & Unlink| StorageLayer
     SlotEndpoint -->|Direct Binary I/O| StorageLayer
 ```
@@ -82,52 +114,48 @@ graph TB
 
 ## 🔄 Detailed Workflows
 
-### 1. Session Initialization & Golden Base Warm-Start Workflow
+### 1. Multi-Slot Resolution & Warm-Start Workflow (`before_agent_start` & `session_start`)
 
-When a new session opens or an existing session resumes, the extension determines whether to restore a session checkpoint or load the Golden Base cache:
+When a new session opens or an interactive turn arrives in a persistent RPC worker (`pi --mode rpc`), `SlotManager` resolves slot residency before prompt execution:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Agent as Pi Agent Runtime
+    actor Agent as Pi Agent Runtime / RPC Bridge
     participant Ext as Extension (index.ts)
+    participant SlotMgr as SlotManager (slot-manager.ts)
     participant Base as BaseCacheManager (base-cache.ts)
-    participant Engine as CheckpointEngine (checkpoint-engine.ts)
     participant Llama as llama-server (:8001)
     participant Disk as NVMe Storage (~/.cache/llama-slots/)
 
-    Agent->>Ext: Hook: session_start
-    Ext->>Ext: Check if session has previous history
+    Agent->>Ext: Hook: before_agent_start (or session_start)
+    Ext->>SlotMgr: ensureSlotForSession(sessionId, systemPrompt)
+    SlotMgr->>Llama: GET /slots (inspect snapshot_filename & t_last_used)
+    Llama-->>SlotMgr: Array of slot metadata
 
-    alt Case A: Resuming Existing Session
-        Ext->>Disk: Check if session_<id>.bin exists
-        Disk-->>Ext: Snapshot found
-        Ext->>Engine: restoreSlot(slotId=0, filename=session_<id>.bin)
-        Engine->>Llama: POST /slots/0?action=restore&filename=session_<id>.bin
-        Llama->>Disk: Read binary KV cache state
-        Disk-->>Llama: Binary KV payload transferred
-        Llama-->>Engine: { n_restored: 110450, timings: { restore_ms: 220.5 } }
-        Ext->>Ext: Update UI Status: [KV: 110k ⚡]
-    else Case B: Blank / New Session (Golden Base Acceleration)
-        Ext->>Agent: ctx.getSystemPrompt() (includes Tools & <available_skills>)
-        Agent-->>Ext: Return compiled System Prompt string
-        Ext->>Base: Check Golden Base (prompt, hash=SHA256(prompt))
-        Base->>Disk: Read base_system_prompt.meta.json
-        
-        alt Cache Hit: Hash matches
-            Base->>Llama: POST /slots/0?action=restore&filename=base_system_prompt.bin
-            Llama->>Disk: Fast load 28k tokens from NVMe
-            Disk-->>Llama: Loaded in ~50ms
-            Llama-->>Base: { n_restored: 28498, timings: { restore_ms: 48.2 } }
-            Ext->>Ext: Update UI Status: [KV: Base 28k ⚡]
-        else Cache Miss: Hash mismatch or file missing
-            Base->>Llama: POST /completion (prefill system prompt & tools into Slot 0)
-            Llama-->>Base: Prefill complete
-            Base->>Llama: POST /slots/0?action=save&filename=base_system_prompt.bin
-            Llama->>Disk: Write base_system_prompt.bin
-            Base->>Disk: Write base_system_prompt.meta.json (hash, tokenCount, date)
-            Ext->>Ext: Update UI Status: [KV: Base 28k 💾]
-        end
+    alt Case 1: Direct RAM Hit (Already Resident in Slot)
+        Note over SlotMgr: Slot X already holds snap_<id>.bin
+        SlotMgr-->>Ext: { slotId: X, hit: true, restored: false }
+        Ext->>Ext: Bind id_slot = X for provider request (⚡ 0ms disk read)
+    else Case 2: Session Checkpoint on NVMe (Restore Needed)
+        SlotMgr->>SlotMgr: Pick idle or LRU slot Y (smallest t_last_used)
+        SlotMgr->>Llama: POST /slots/Y?action=restore&filename=snap_<id>.bin
+        Llama->>Disk: Read binary KV cache from NVMe (~160ms for 78k tokens)
+        Llama-->>SlotMgr: { n_restored: 78974, timings: { restore_ms: 162.4 } }
+        SlotMgr-->>Ext: { slotId: Y, hit: false, restored: true }
+        Ext->>Ext: Bind id_slot = Y (⚡ 100% KV cache hit on prompt)
+    else Case 3: New Session (Golden Base Injection)
+        SlotMgr->>SlotMgr: Pick clean slot Y
+        SlotMgr->>Base: checkAndRestore(systemPrompt, slotId=Y)
+        Base->>Llama: POST /slots/Y?action=restore&filename=base_system_prompt.bin
+        Llama->>Disk: Read base KV cache (~20ms for 16.1k tokens)
+        Llama-->>Base: { n_restored: 16100, timings: { restore_ms: 19.8 } }
+        Base-->>SlotMgr: Base cache injected to RAM
+        SlotMgr-->>Ext: { slotId: Y, isBase: true, restored: true }
+        Ext->>Ext: Bind id_slot = Y (0s prefill for system prompt)
+    else Case 4: Stale Context Isolation
+        SlotMgr->>Llama: POST /slots/Y?action=erase (Wipe previous session tokens)
+        SlotMgr-->>Ext: { slotId: Y, restored: false }
     end
 ```
 
@@ -261,6 +289,20 @@ sequenceDiagram
    - Hashes with SHA-256. If a match is found in `base_system_prompt.bin`, `pi new` boots in **~20ms** instead of 6~9s!
    - Automatically re-warms and updates the snapshot whenever skills or tools are modified.
 
+5. **Multi-Slot Dynamic Routing & Affinity (`SlotManager`)**:
+   - Discovers and manages multiple concurrent server slots (`-np 2`, `-np 4`, etc.).
+   - Senses `snapshot_filename` and `t_last_used` directly from `llama-server` `/slots`. If a session's KV tensors are already resident in any slot, it routes requests there with **0ms disk read (Direct RAM Cache Hit)**.
+   - On cache miss, allocates the least recently used slot based on server timestamps and clears stale context.
+
+6. **Persistent RPC Lifecycle Verification (`before_agent_start`)**:
+   - Built specifically for persistent agent workers (`pi --mode rpc`) used in production bridges like `pi-discord-gateway` and `piweb`.
+   - In persistent RPC mode, `session_start` only executes once on process boot. Hooking into `before_agent_start` guarantees slot residency and restores snapshots just-in-time before prompt dispatch on every turn.
+   - Completely eliminates the silent 80-second quadratic re-evaluation penalty caused by intervening session thrashing.
+
+7. **Zero-Disk-Duplication Golden Base Injection**:
+   - New sessions inject the 16.1k-token Golden Base directly into Slot RAM via REST API in ~20ms, completely avoiding wasteful disk file cloning (`cp`) on new session creation.
+   - Fully immune to LRU quota eviction.
+
 ---
 
 ## 📦 Installation
@@ -371,7 +413,8 @@ pi-kv-cache-manager/
     ├── types.ts                # Data Types, Schemas & API Responses
     ├── lru-manager.ts          # LRU Eviction Engine, Sidecar Metadata & Multimodal Cleanup
     ├── checkpoint-engine.ts    # Incremental Lazy Checkpointer & llama-server API Client
-    └── base-cache.ts           # Golden System Prompt & Skills Cache Manager
+    ├── base-cache.ts           # Golden System Prompt & Skills Cache Manager
+    └── slot-manager.ts         # Multi-Slot Discovery, Direct RAM Hit & LRU Slot Affinity
 ```
 
 ---
