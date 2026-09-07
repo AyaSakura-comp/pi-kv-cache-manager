@@ -1,5 +1,5 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index e719bab73..d9060841d 100644
+index e719bab73..71e76cdcb 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -2018,6 +2018,9 @@ private:
@@ -12,7 +12,7 @@ index e719bab73..d9060841d 100644
  
                      if (slot->prompt.tokens.has_media()) {
                          json media_meta = json::array();
-@@ -2093,10 +2096,24 @@ private:
+@@ -2093,10 +2096,20 @@ private:
                          send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                          break;
                      }
@@ -30,14 +30,24 @@ index e719bab73..d9060841d 100644
                      tokens.resize(token_count);
                      slot->prompt.tokens.clear();
                      slot->prompt.tokens.insert(tokens);
-                     slot->prompt.checkpoints.clear();
-+                    if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
-+                        create_checkpoint(*slot, 0, 0, token_count - 1);
-+                    }
+-                    slot->prompt.checkpoints.clear();
                      slot->snapshot_filename = filename;
                      slot->t_last_used = ggml_time_us();
  
-@@ -2677,6 +2694,9 @@ private:
+@@ -2131,6 +2144,12 @@ private:
+                         }
+                     }
+ 
++                    slot->prompt.checkpoints.clear();
++                    if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
++                        const llama_pos pos_max = std::max(0, slot->prompt.tokens.pos_next() - 1);
++                        create_checkpoint(*slot, 0, 0, pos_max);
++                    }
++
+                     const int64_t t_end = ggml_time_us();
+                     const double t_restore_ms = (t_end - t_start) / 1000.0;
+ 
+@@ -2677,6 +2696,9 @@ private:
                                              // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                              LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                  func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
@@ -47,7 +57,7 @@ index e719bab73..d9060841d 100644
                                              return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                          }
                                      );
-@@ -2689,6 +2709,10 @@ private:
+@@ -2689,6 +2711,10 @@ private:
                                          it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                          it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
  
@@ -58,7 +68,7 @@ index e719bab73..d9060841d 100644
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                          SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
-@@ -2748,18 +2772,20 @@ private:
+@@ -2748,18 +2774,20 @@ private:
  
                      SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
  
