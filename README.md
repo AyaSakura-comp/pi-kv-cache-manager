@@ -303,14 +303,19 @@ sequenceDiagram
    - New sessions inject the 16.1k-token Golden Base directly into Slot RAM via REST API in ~20ms, completely avoiding wasteful disk file cloning (`cp`) on new session creation.
    - Fully immune to LRU quota eviction.
 
+8. **Qwen `preserve_thinking` & Chat Template Cache Alignment (`patches/0003-...`)**:
+   - Fixes upstream Qwen Jinja Chat Template behavior when `preserve_thinking: true`. If reasoning is absent or empty in assistant turns, the default template incorrectly injects `<think>\n\n</think>\n\n` (rogue token 271), causing prefix divergence from the raw KV cache and wiping 50k+ tokens on every subsequent turn.
+   - Guards slot save against stale `.media.json` residue, validates media chunk bounds on restore, and calculates checkpoint `pos_max` using `llama_memory_seq_pos_max` to prevent M-RoPE position assertion crashes (`X < Y`).
+
 ---
 
 ## 📦 Installation
 
-### 1. Apply Upstream `llama.cpp` Patch (Optional but Recommended)
-If your `llama-server` runs with `--mmproj`:
+### 1. Apply Upstream `llama.cpp` Patches (Recommended)
 ```bash
 git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0001-allow-text-slot-save-restore-with-mmproj.patch
+git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0002-sync-mtp-draft-kv-cache-slots.patch
+git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0003-fix-qwen-preserve-thinking-and-slot-pos-max.patch
 cmake --build /path/to/llama.cpp/build --target llama-server -j$(nproc)
 ```
 
@@ -419,7 +424,8 @@ pi-kv-cache-manager/
 ├── tsconfig.json               # ES2022 / NodeNext TypeScript Configuration
 ├── patches/
 │   ├── 0001-allow-text-slot-save-restore-with-mmproj.patch # Upstream PR patch for llama.cpp
-│   └── 0002-sync-mtp-draft-kv-cache-slots.patch           # Dual-track MTP draft KV sync & checkpoint fix
+│   ├── 0002-sync-mtp-draft-kv-cache-slots.patch           # Dual-track MTP draft KV sync & checkpoint fix
+│   └── 0003-fix-qwen-preserve-thinking-and-slot-pos-max.patch # Qwen template & slot checkpoint alignment
 └── src/
     ├── index.ts                # Pi Agent Extension Entry Point, Hooks & Command Wiring
     ├── config.ts               # Configuration Loader & Defaults (30 sessions / 40GB)

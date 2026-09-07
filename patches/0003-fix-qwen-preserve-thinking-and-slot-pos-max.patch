@@ -1,0 +1,147 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 70b9f5dc2..d3b4c6883 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -631,6 +631,50 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model *
+                            "{%- if false %}");
+     }
+ 
++    // Patch Qwen chat template bug: when preserve_thinking is true, empty or absent reasoning
++    // injects spurious <think>\n\n</think>\n\n tags, causing token divergence and full KV cache wipe.
++    auto patch_qwen_preserve_thinking = [](std::string & src) {
++        if (src.find("preserve_thinking") == std::string::npos ||
++            src.find("reasoning_content = reasoning_content|trim") == std::string::npos) {
++            return;
++        }
++
++        const std::string qwen_target =
++            "        {%- set reasoning_content = reasoning_content|trim %}\n"
++            "        {%- if (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index) %}\n"
++            "            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n"
++            "        {%- else %}\n"
++            "            {{- '<|im_start|>' + message.role + '\\n' + content }}\n"
++            "        {%- endif %}";
++
++        const std::string qwen_fix =
++            "        {%- set has_thinking = false %}\n"
++            "        {%- if message.reasoning_content is string and message.reasoning_content|trim %}\n"
++            "            {%- set has_thinking = true %}\n"
++            "        {%- elif content is string and (\"</think>\" in content or \"<think>\" in content) %}\n"
++            "            {%- set has_thinking = true %}\n"
++            "        {%- endif %}\n"
++            "        {%- set reasoning_content = reasoning_content|trim %}\n"
++            "        {%- if has_thinking and ((preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)) %}\n"
++            "            {%- if reasoning_content %}\n"
++            "                {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n"
++            "            {%- else %}\n"
++            "                {{- '<|im_start|>' + message.role + '\\n<think>\\n</think>\\n\\n' + content }}\n"
++            "            {%- endif %}\n"
++            "        {%- else %}\n"
++            "            {{- '<|im_start|>' + message.role + '\\n' + content }}\n"
++            "        {%- endif %}";
++
++        if (src.find(qwen_target) != std::string::npos) {
++            string_replace_all(src, qwen_target, qwen_fix);
++            LOG_INF("common_chat_templates_init: patched Qwen chat template preserve_thinking newline alignment\n");
++        }
++    };
++    patch_qwen_preserve_thinking(default_template_src);
++    if (!template_tool_use_src.empty()) {
++        patch_qwen_preserve_thinking(template_tool_use_src);
++    }
++
+     std::string token_bos = bos_token_override;
+     std::string token_eos = eos_token_override;
+     bool        add_bos   = false;
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index b80b5c61e..82d169c6d 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -256,11 +256,14 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
+         llama_pos res = tokens.size();
+ 
+         for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
++            if (it->first >= tokens.size()) {
++                continue;
++            }
+             const auto & chunk = it->second;
+             res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
+         }
+ 
+-        return res;
++        return std::max((llama_pos)0, res);
+     }
+ 
+     int64_t idx = 0;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 71e76cdcb..09cb5817e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2049,6 +2049,8 @@ private:
+                             ofs << media_meta.dump(2);
+                             ofs.close();
+                         }
++                    } else {
++                        std::remove((filepath + ".media.json").c_str());
+                     }
+ 
+                     slot->snapshot_filename = filename;
+@@ -2121,6 +2123,10 @@ private:
+                             if (media_meta.is_array()) {
+                                 for (const auto & entry : media_meta) {
+                                     size_t idx = entry.value("idx", (size_t)0);
++                                    if (idx >= tokens.size()) {
++                                        SRV_WRN("ignoring out-of-bounds media chunk at idx %zu (tokens.size() = %zu)\n", idx, tokens.size());
++                                        continue;
++                                    }
+                                     int type = entry.value("type", (int)MTMD_INPUT_CHUNK_TYPE_IMAGE);
+                                     std::string id = entry.value("id", "");
+                                     if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+@@ -2146,7 +2152,9 @@ private:
+ 
+                     slot->prompt.checkpoints.clear();
+                     if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
+-                        const llama_pos pos_max = std::max(0, slot->prompt.tokens.pos_next() - 1);
++                        const llama_pos pos_max_mem = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
++                        const llama_pos pos_max_tok = slot->prompt.tokens.empty() ? 0 : slot->prompt.tokens.pos_next() - 1;
++                        const llama_pos pos_max = std::max((llama_pos)0, std::max(pos_max_mem, pos_max_tok));
+                         create_checkpoint(*slot, 0, 0, pos_max);
+                     }
+ 
+@@ -2645,8 +2653,8 @@ private:
+                                 // when the prompt prefix does not match, print the tokens around the mismatch
+                                 // this is useful for debugging prompt caching
+                                 if (slots_debug) {
+-                                    const int np0 = std::max<int>(n_past - 4, 0);
+-                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
++                                    const int np0 = std::max<int>(n_past - 10, 0);
++                                    const int np1 = std::min<int>(n_past + 10, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
+ 
+                                     std::stringstream ss0;
+                                     std::stringstream ss1;
+@@ -2661,6 +2669,8 @@ private:
+                                         if (i == n_past) {
+                                             ss0 << " | ";
+                                             ss1 << " | ";
++                                            st0 << " | ";
++                                            st1 << " | ";
+                                         }
+ 
+                                         {
+@@ -2678,11 +2688,12 @@ private:
+                                         }
+                                     }
+ 
+-                                    SLT_WRN(slot, "%s\n", ss0.str().c_str());
+-                                    SLT_WRN(slot, "%s\n", ss1.str().c_str());
++                                    SLT_DBG(slot, "MISMATCH DEBUG at n_past = %d:\n", n_past);
++                                    SLT_DBG(slot, "%s\n", ss0.str().c_str());
++                                    SLT_DBG(slot, "%s\n", ss1.str().c_str());
+ 
+-                                    SLT_WRN(slot, "%s\n", st0.str().c_str());
+-                                    SLT_WRN(slot, "%s\n", st1.str().c_str());
++                                    SLT_DBG(slot, "%s\n", st0.str().c_str());
++                                    SLT_DBG(slot, "%s\n", st1.str().c_str());
+                                 }
+ 
+                                 if (pos_min >= pos_min_thold) {
