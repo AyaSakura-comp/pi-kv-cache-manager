@@ -129,7 +129,19 @@ export class BaseCacheManager {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return { status: "error", hash: currentHash, error: msg };
+      console.warn(
+        `[pi-kv-cache-manager] Failed to restore base snapshot (${msg}), invalidating incompatible cache...`
+      );
+      try {
+        await fs.unlink(this.getBinPath());
+      } catch {}
+      try {
+        await fs.unlink(this.getBinPath() + ".dft");
+      } catch {}
+      try {
+        await fs.unlink(this.getMetaPath());
+      } catch {}
+      return { status: "miss", hash: currentHash, error: msg };
     }
   }
 

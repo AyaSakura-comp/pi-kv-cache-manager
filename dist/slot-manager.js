@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
-import { fetchSlots, restoreSlot, eraseSlot } from "./checkpoint-engine.js";
+import { fetchSlots, restoreSlot, eraseSlot, sanitizeFilename } from "./checkpoint-engine.js";
 import { BASE_SNAPSHOT_BIN } from "./base-cache.js";
 export class SlotManager {
     config;
@@ -100,19 +100,38 @@ export class SlotManager {
             snapExists = false;
         }
         if (snapExists) {
-            const resp = await restoreSlot(this.config.llamaServerUrl, targetSlotId, snapFilename);
-            await this.lru.touchSnapshot(snapFilename);
-            const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
-            const durationMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
-            this.engine.setSavedTokens(sessionId, tokens);
-            this.activeSlotSessions.set(targetSlotId, sessionId);
-            return {
-                slotId: targetSlotId,
-                hit: false,
-                restored: true,
-                tokens,
-                durationMs,
-            };
+            try {
+                const resp = await restoreSlot(this.config.llamaServerUrl, targetSlotId, snapFilename);
+                await this.lru.touchSnapshot(snapFilename);
+                const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
+                const durationMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
+                this.engine.setSavedTokens(sessionId, tokens);
+                this.activeSlotSessions.set(targetSlotId, sessionId);
+                return {
+                    slotId: targetSlotId,
+                    hit: false,
+                    restored: true,
+                    tokens,
+                    durationMs,
+                };
+            }
+            catch (err) {
+                console.warn(`[pi-kv-cache-manager] Failed to restore session snapshot ${snapFilename} (${err}), invalidating incompatible session cache...`);
+                try {
+                    await fs.unlink(snapPath);
+                }
+                catch { }
+                try {
+                    await fs.unlink(snapPath + ".dft");
+                }
+                catch { }
+                try {
+                    const metaPath = path.join(this.config.cacheDir, `snap_${sanitizeFilename(sessionId)}.meta.json`);
+                    await fs.unlink(metaPath);
+                }
+                catch { }
+                snapExists = false;
+            }
         }
         if (!snapExists && tools === undefined) {
             return {
@@ -146,8 +165,8 @@ export class SlotManager {
                     durationMs: baseRes.durationMs,
                 };
             }
-            else if (baseRes.status === "miss") {
-                // Auto-warm and snapshot Golden Base on miss (system prompt or tools changed or first run)
+            else if (baseRes.status === "miss" || baseRes.status === "error") {
+                // Auto-warm and snapshot Golden Base on miss or error (system prompt or tools changed or first run)
                 try {
                     const warmRes = await this.baseCache.warmAndSave(systemPrompt, baseRes.hash, targetSlotId, tools);
                     this.activeSlotSessions.set(targetSlotId, sessionId);
