@@ -1,7 +1,7 @@
+import { checkCancelled } from "./request.js";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
-import { fetchSlots, restoreSlot, eraseSlot, sanitizeFilename } from "./checkpoint-engine.js";
-import { BASE_SNAPSHOT_BIN } from "./base-cache.js";
+import { fetchSlots, restoreSlot, eraseSlot } from "./checkpoint-engine.js";
 export class SlotManager {
     config;
     lru;
@@ -29,12 +29,15 @@ export class SlotManager {
         }
     }
     async ensureSlotForSession(sessionId, systemPrompt, tools) {
+        checkCancelled(this.config);
+        await this.config.assertCurrent?.();
         const snapFilename = this.engine.getSnapshotFilename(sessionId);
         let slots = [];
         try {
-            slots = await fetchSlots(this.config.llamaServerUrl);
+            slots = await fetchSlots(this.config.llamaServerUrl, this.config);
         }
         catch (err) {
+            checkCancelled(this.config, err);
             console.warn(`[pi-kv-cache-manager] Failed to fetch slots from ${this.config.llamaServerUrl}, using fallback slot ${this.config.slotId}:`, err);
             slots = [{ id: this.config.slotId, n_ctx: 0, is_processing: false, snapshot_filename: "" }];
         }
@@ -49,7 +52,7 @@ export class SlotManager {
                 if (live) {
                     if (live.snapshot_filename &&
                         live.snapshot_filename !== snapFilename &&
-                        live.snapshot_filename !== BASE_SNAPSHOT_BIN) {
+                        live.snapshot_filename !== this.baseCache.getFilename()) {
                         this.activeSlotSessions.delete(slotId);
                     }
                     else {
@@ -64,7 +67,9 @@ export class SlotManager {
         }
         // B) Does any slot currently have our snapshot_filename loaded?
         const residentSlot = slots.find((s) => s.snapshot_filename === snapFilename);
-        if (residentSlot) {
+        const snapMeta = await this.lru.readMetadata(path.join(this.config.cacheDir, snapFilename.replace(/\.bin$/, ".meta.json")));
+        if (residentSlot && snapMeta) {
+            checkCancelled(this.config);
             this.activeSlotSessions.set(residentSlot.id, sessionId);
             return {
                 slotId: residentSlot.id,
@@ -94,18 +99,24 @@ export class SlotManager {
         let snapExists = false;
         try {
             await fs.access(snapPath);
-            snapExists = true;
+            snapExists = !!snapMeta;
         }
-        catch {
+        catch (error) {
+            checkCancelled(this.config, error);
             snapExists = false;
         }
         if (snapExists) {
             try {
-                const resp = await restoreSlot(this.config.llamaServerUrl, targetSlotId, snapFilename);
+                checkCancelled(this.config);
+                await this.config.assertCurrent?.();
+                const resp = await restoreSlot(this.config.llamaServerUrl, targetSlotId, snapFilename, this.config);
+                checkCancelled(this.config);
+                await this.config.assertCurrent?.();
                 await this.lru.touchSnapshot(snapFilename);
                 const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
                 const durationMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
                 this.engine.setSavedTokens(sessionId, tokens);
+                checkCancelled(this.config);
                 this.activeSlotSessions.set(targetSlotId, sessionId);
                 return {
                     slotId: targetSlotId,
@@ -116,20 +127,9 @@ export class SlotManager {
                 };
             }
             catch (err) {
-                console.warn(`[pi-kv-cache-manager] Failed to restore session snapshot ${snapFilename} (${err}), invalidating incompatible session cache...`);
-                try {
-                    await fs.unlink(snapPath);
-                }
-                catch { }
-                try {
-                    await fs.unlink(snapPath + ".dft");
-                }
-                catch { }
-                try {
-                    const metaPath = path.join(this.config.cacheDir, `snap_${sanitizeFilename(sessionId)}.meta.json`);
-                    await fs.unlink(metaPath);
-                }
-                catch { }
+                checkCancelled(this.config, err);
+                console.warn(`[pi-kv-cache-manager] Failed to restore session snapshot ${snapFilename} (${err}); preserving files and trying the base cache...`);
+                // Preserve caches on transport/runtime uncertainty. A failed restore is not corruption proof.
                 snapExists = false;
             }
         }
@@ -143,18 +143,9 @@ export class SlotManager {
         // 4. If new session (no snapshot on disk), check Golden Base Cache
         // ONLY check/warm if tools are provided (ensures full system prompt + tool schemas are present)
         if (this.config.enableBaseCache && systemPrompt && systemPrompt.length > 0 && tools !== undefined) {
-            const targetLive = slots.find((s) => s.id === targetSlotId);
-            if (targetLive?.snapshot_filename === BASE_SNAPSHOT_BIN) {
-                this.activeSlotSessions.set(targetSlotId, sessionId);
-                return {
-                    slotId: targetSlotId,
-                    hit: true,
-                    restored: false,
-                    isBase: true,
-                };
-            }
             const baseRes = await this.baseCache.checkAndRestore(systemPrompt, targetSlotId, tools);
             if (baseRes.status === "hit") {
+                checkCancelled(this.config);
                 this.activeSlotSessions.set(targetSlotId, sessionId);
                 return {
                     slotId: targetSlotId,
@@ -169,32 +160,39 @@ export class SlotManager {
                 // Auto-warm and snapshot Golden Base on miss or error (system prompt or tools changed or first run)
                 try {
                     const warmRes = await this.baseCache.warmAndSave(systemPrompt, baseRes.hash, targetSlotId, tools);
+                    checkCancelled(this.config);
                     this.activeSlotSessions.set(targetSlotId, sessionId);
                     return {
                         slotId: targetSlotId,
                         hit: false,
-                        restored: true,
+                        restored: false,
+                        warmed: true,
                         isBase: true,
                         tokens: warmRes.tokens,
                         durationMs: warmRes.durationMs,
                     };
                 }
                 catch (err) {
+                    checkCancelled(this.config, err);
                     console.warn("[pi-kv-cache-manager] Auto-warming base cache failed, falling back to cold start:", err);
                 }
             }
         }
+        checkCancelled(this.config);
+        await this.config.assertCurrent?.();
         // 5. If no snapshot and base cache wasn't restored, but target slot had a previous session's snapshot:
         // Erase the slot so stale context does not pollute the new session
         if (chosenSlot && (chosenSlot.snapshot_filename || this.activeSlotSessions.has(targetSlotId))) {
             try {
-                await eraseSlot(this.config.llamaServerUrl, targetSlotId);
+                await eraseSlot(this.config.llamaServerUrl, targetSlotId, this.config);
             }
-            catch {
+            catch (error) {
+                checkCancelled(this.config, error);
                 // Best effort
             }
         }
         if (tools !== undefined || snapExists) {
+            checkCancelled(this.config);
             this.activeSlotSessions.set(targetSlotId, sessionId);
         }
         return {

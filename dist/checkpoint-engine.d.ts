@@ -1,10 +1,11 @@
+import { type RequestOptions } from "./request.js";
 import type { KvManagerConfig, LlamaSlotActionResponse, LlamaSlotInfo } from "./types.js";
 import { LruManager } from "./lru-manager.js";
-export declare function fetchSlots(baseUrl: string): Promise<LlamaSlotInfo[]>;
+export declare function fetchSlots(baseUrl: string, options?: RequestOptions): Promise<LlamaSlotInfo[]>;
 export declare function sanitizeFilename(name: string): string;
-export declare function saveSlot(baseUrl: string, slotId: number, filename: string): Promise<LlamaSlotActionResponse>;
-export declare function restoreSlot(baseUrl: string, slotId: number, filename: string): Promise<LlamaSlotActionResponse>;
-export declare function eraseSlot(baseUrl: string, slotId: number): Promise<void>;
+export declare function saveSlot(baseUrl: string, slotId: number, filename: string, options?: RequestOptions): Promise<LlamaSlotActionResponse>;
+export declare function restoreSlot(baseUrl: string, slotId: number, filename: string, options?: RequestOptions): Promise<LlamaSlotActionResponse>;
+export declare function eraseSlot(baseUrl: string, slotId: number, options?: RequestOptions): Promise<void>;
 export declare class CheckpointEngine {
     private config;
     private lru;

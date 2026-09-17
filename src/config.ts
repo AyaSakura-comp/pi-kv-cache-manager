@@ -44,14 +44,5 @@ export function loadConfig(cwd?: string): KvManagerConfig {
     ...userConfig,
   };
 
-  // Ensure cache directory exists
-  if (!fs.existsSync(merged.cacheDir)) {
-    try {
-      fs.mkdirSync(merged.cacheDir, { recursive: true });
-    } catch {
-      // Best-effort directory creation
-    }
-  }
-
   return merged;
 }

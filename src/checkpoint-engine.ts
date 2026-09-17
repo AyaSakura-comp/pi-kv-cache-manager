@@ -1,10 +1,11 @@
+import { boundedFetch, checkCancelled, type RequestOptions } from "./request.js";
 import * as path from "node:path";
 import type { KvManagerConfig, LlamaSlotActionResponse, LlamaSlotInfo, SnapshotMetadata } from "./types.js";
 import { LruManager } from "./lru-manager.js";
 
-export async function fetchSlots(baseUrl: string): Promise<LlamaSlotInfo[]> {
+export async function fetchSlots(baseUrl: string, options: RequestOptions = {}): Promise<LlamaSlotInfo[]> {
   const url = `${baseUrl.replace(/\/+$/, "")}/slots`;
-  const res = await fetch(url);
+  const res = await boundedFetch(url, {}, options);
   if (!res.ok) {
     throw new Error(`Failed to fetch slots from llama-server: HTTP ${res.status}`);
   }
@@ -19,14 +20,15 @@ export function sanitizeFilename(name: string): string {
 export async function saveSlot(
   baseUrl: string,
   slotId: number,
-  filename: string
+  filename: string,
+  options: RequestOptions = {}
 ): Promise<LlamaSlotActionResponse> {
   const url = `${baseUrl.replace(/\/+$/, "")}/slots/${slotId}?action=save`;
-  const res = await fetch(url, {
+  const res = await boundedFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ filename }),
-  });
+  }, options);
 
   const data = (await res.json()) as LlamaSlotActionResponse;
   if (!res.ok) {
@@ -39,14 +41,15 @@ export async function saveSlot(
 export async function restoreSlot(
   baseUrl: string,
   slotId: number,
-  filename: string
+  filename: string,
+  options: RequestOptions = {}
 ): Promise<LlamaSlotActionResponse> {
   const url = `${baseUrl.replace(/\/+$/, "")}/slots/${slotId}?action=restore`;
-  const res = await fetch(url, {
+  const res = await boundedFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ filename }),
-  });
+  }, options);
 
   const data = (await res.json()) as LlamaSlotActionResponse;
   if (!res.ok) {
@@ -56,13 +59,13 @@ export async function restoreSlot(
   return data;
 }
 
-export async function eraseSlot(baseUrl: string, slotId: number): Promise<void> {
+export async function eraseSlot(baseUrl: string, slotId: number, options: RequestOptions = {}): Promise<void> {
   const url = `${baseUrl.replace(/\/+$/, "")}/slots/${slotId}?action=erase`;
-  const res = await fetch(url, {
+  const res = await boundedFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({}),
-  });
+  }, options);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`llama-server slot erase failed: ${text}`);
@@ -93,7 +96,7 @@ export class CheckpointEngine {
   }
 
   getSnapshotFilename(sessionId: string): string {
-    return `snap_${sanitizeFilename(sessionId)}.bin`;
+    return `${this.config.snapshotPrefix ?? ""}snap_${sanitizeFilename(sessionId)}.bin`;
   }
 
   /**
@@ -108,6 +111,7 @@ export class CheckpointEngine {
     onSuccess?: (info: { tokens: number; durationMs: number; bytes: number }) => void,
     onError?: (error: Error) => void
   ): Promise<boolean> {
+    checkCancelled(this.config);
     if (!this.config.enableIncrementalSave) {
       return false;
     }
@@ -134,18 +138,23 @@ export class CheckpointEngine {
     const metaPath = path.join(this.config.cacheDir, metaFilename);
 
     try {
+      await this.config.assertCurrent?.();
+      const existingMeta = await this.lru.readMetadata(metaPath);
+      checkCancelled(this.config);
+      await this.lru.invalidateSnapshot(filename);
       const resp = await saveSlot(
         this.config.llamaServerUrl,
         slotId,
-        filename
+        filename, this.config
       );
 
+      await this.config.assertCurrent?.();
+      checkCancelled(this.config);
       const savedTokens = resp.n_saved ?? resp.n_tokens ?? currentTokens;
       const savedBytes = resp.n_written ?? resp.n_bytes ?? 0;
       const saveMs = resp.timings?.save_ms ?? resp.t_ms ?? 0;
       this.sessionSavedTokens.set(sessionId, savedTokens);
 
-      const existingMeta = await this.lru.readMetadata(metaPath);
       const now = new Date().toISOString();
 
       const meta: SnapshotMetadata = {
@@ -159,11 +168,14 @@ export class CheckpointEngine {
         isBaseSnapshot: false,
       };
 
+      checkCancelled(this.config);
       await this.lru.writeMetadata(metaPath, meta);
 
       // Run LRU check to maintain session quota
+      await this.config.assertCurrent?.();
       await this.lru.enforceLRU(this.config);
 
+      checkCancelled(this.config);
       if (onSuccess) {
         onSuccess({
           tokens: savedTokens,
@@ -174,7 +186,7 @@ export class CheckpointEngine {
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       console.error(`[pi-kv-cache-manager] Checkpoint error for ${sessionId}:`, error);
-      if (onError) onError(error);
+      if (!this.config.signal?.aborted && !["AbortError", "TimeoutError"].includes(error.name) && onError) onError(error);
     } finally {
       this.inFlightSaves.delete(sessionId);
     }

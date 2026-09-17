@@ -1,10 +1,10 @@
 import * as path from "node:path";
-import * as fs from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "./config.js";
+import { DEFAULT_CONFIG, loadConfig } from "./config.js";
+import { resolveRuntime, RuntimeQueue, type ResolvedRuntime } from "./runtime.js";
 import { LruManager } from "./lru-manager.js";
-import { CheckpointEngine, saveSlot, restoreSlot, sanitizeFilename, fetchSlots } from "./checkpoint-engine.js";
-import { BaseCacheManager, BASE_SNAPSHOT_BIN, computeHash } from "./base-cache.js";
+import { CheckpointEngine, saveSlot, restoreSlot, fetchSlots } from "./checkpoint-engine.js";
+import { BaseCacheManager, computeHash, stableStringify } from "./base-cache.js";
 import { SlotManager } from "./slot-manager.js";
 import type { KvManagerConfig } from "./types.js";
 
@@ -75,14 +75,8 @@ function isLlamaServerContext(ctx: ExtensionContext, config: KvManagerConfig): b
   if (model.baseUrl) {
     try {
       const modelUrl = new URL(model.baseUrl);
-      const serverUrl = new URL(config.llamaServerUrl);
-      const isLoopback = (host: string) =>
-        host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0";
-      if (isLoopback(modelUrl.hostname) && isLoopback(serverUrl.hostname)) {
-        if (modelUrl.port === serverUrl.port || (!modelUrl.port && serverUrl.port === "80")) {
-          return true;
-        }
-      }
+      // Eligibility only. Actual listener ownership is verified before any slot API call.
+      if (["127.0.0.1", "[::1]", "localhost"].includes(modelUrl.hostname)) return true;
     } catch {
       // Ignore URL parse error
     }
@@ -91,14 +85,115 @@ function isLlamaServerContext(ctx: ExtensionContext, config: KvManagerConfig): b
   return false;
 }
 
-export default function piKvCacheManager(pi: ExtensionAPI): void {
-  const config: KvManagerConfig = loadConfig();
-  const lru = new LruManager(config.cacheDir);
-  const engine = new CheckpointEngine(config, lru);
-  const baseCache = new BaseCacheManager(config, lru);
-  const slotManager = new SlotManager(config, lru, engine, baseCache);
+export interface RuntimeDependencies {
+  resolve?: (baseUrl: string, io?: { signal?: AbortSignal }) => Promise<ResolvedRuntime>;
+  loadConfig?: typeof loadConfig;
+}
 
+export default function piKvCacheManager(pi: ExtensionAPI, dependencies: RuntimeDependencies = {}): void {
+  const discover = dependencies.resolve ?? resolveRuntime;
+  const readConfig = dependencies.loadConfig ?? loadConfig;
+  let config: KvManagerConfig = DEFAULT_CONFIG;
+  let lru: LruManager;
+  let engine: CheckpointEngine;
+  let baseCache: BaseCacheManager;
+  let slotManager: SlotManager;
+  let runtimeKey = "";
+  let ready = false;
+  let selectedModel = "";
+  let lastPrefix: { prompt: string; tools: unknown[] } | undefined;
+  const queue = new RuntimeQueue();
+  let lifetime = new AbortController();
+  let activeContext = "";
+  const guardContext = <T extends ExtensionContext>(ctx: T, signal: AbortSignal): T => new Proxy(ctx, {
+    get(target, key) {
+      if (key !== "ui") return Reflect.get(target, key);
+      return new Proxy(target.ui, { get(ui, method) {
+        const value = Reflect.get(ui, method);
+        return typeof value === "function" ? (...args: unknown[]) => {
+          if (!signal.aborted) return value.apply(ui, args);
+        } : value;
+      }});
+    },
+  });
+  const on = (name: string, handler: (event: any, ctx: ExtensionContext) => Promise<unknown>) =>
+    pi.on(name, (event, ctx) => {
+      const contextKey = stableStringify([ctx.model, ctx.sessionManager?.getSessionId()]);
+      if (["model_select", "session_start", "session_switch", "session_shutdown"].includes(name) ||
+          (name === "before_provider_request" && (lifetime.signal.aborted || (activeContext && activeContext !== contextKey)))) {
+        lifetime.abort(new DOMException("KV lifecycle changed", "AbortError"));
+        lifetime = new AbortController();
+        invalidate();
+      }
+      activeContext = contextKey;
+      const signal = lifetime.signal;
+      return queue.run(async () => {
+        if (signal.aborted) return;
+        try { return await handler(event, guardContext(ctx, signal)); }
+        catch (error) { if (!signal.aborted) throw error; }
+      });
+    });
   const sessionSlots = new Map<string, number>();
+  const modelKey = (ctx: ExtensionContext) => stableStringify(ctx.model);
+  const invalidate = () => { ready = false; runtimeKey = ""; sessionSlots.clear(); lastPrefix = undefined; };
+  const refresh = async (ctx: ExtensionContext, payload: Record<string, any>): Promise<boolean> => {
+    const controller = lifetime;
+    const signal = controller.signal;
+    try {
+      signal.throwIfAborted();
+      const settings = readConfig(typeof ctx.isProjectTrusted === "function" && !ctx.isProjectTrusted() ? undefined : ctx.cwd);
+      if (!isLlamaServerContext(ctx, settings)) throw new Error("Not a llama-server model");
+      const model = ctx.model as { baseUrl?: string };
+      if (!model.baseUrl) throw new Error("Selected model endpoint unavailable");
+      const resolved = await discover(model.baseUrl, { signal });
+      signal.throwIfAborted();
+      const messages = payload.messages;
+      if (!Array.isArray(messages) || messages[0]?.role !== "system" || typeof messages[0]?.content !== "string" ||
+          messages.slice(1).some((m: any) => m.role === "system" || m.role === "developer")) {
+        throw new Error("A single serialized system prefix is required");
+      }
+      if (Object.keys(payload).some(key => /lora|adapter/i.test(key))) {
+        throw new Error("Per-request adapter overrides are not supported for persistent reuse");
+      }
+      const tools = payload.tools ?? [];
+      if (!Array.isArray(tools)) throw new Error("Unsupported tool payload");
+      const { messages: _messages, tools: _tools, id_slot: _slot, stream: _stream, stream_options: _streamOptions, ...options } = payload;
+      const prefix = computeHash(stableStringify({ prompt: messages[0].content, tools, options }));
+      const snapshotPrefix = `kv2_${computeHash(resolved.identity + prefix)}_`;
+      const key = stableStringify({ resolved, settings, snapshotPrefix });
+      if (!ready || key !== runtimeKey) {
+        invalidate();
+        const assertCurrent = async () => {
+          signal.throwIfAborted();
+          const now = await discover(model.baseUrl!, { signal });
+          signal.throwIfAborted();
+          if (stableStringify(now) !== stableStringify(resolved)) throw new Error("KV runtime changed; skip stale work");
+        };
+        config = { ...settings, llamaServerUrl: resolved.serverUrl, cacheDir: resolved.cacheDir,
+          runtimeIdentity: resolved.identity, snapshotPrefix, templateOptions: options, assertCurrent,
+          signal, abortRuntime: reason => controller.abort(reason), transport: resolved.transport };
+        lru = new LruManager(config.cacheDir, snapshotPrefix, signal);
+        engine = new CheckpointEngine(config, lru);
+        baseCache = new BaseCacheManager(config, lru);
+        slotManager = new SlotManager(config, lru, engine, baseCache);
+        runtimeKey = key;
+        ready = true;
+      }
+      selectedModel = modelKey(ctx);
+      lastPrefix = { prompt: messages[0].content, tools };
+      return true;
+    } catch (error) {
+      invalidate();
+      try { ctx.ui.setStatus(STATUS_KEY, "KV: persistent reuse disabled (unverified runtime)"); } catch {}
+      console.warn(`[pi-kv-cache-manager] Persistent reuse disabled: ${String(error)}`);
+      return false;
+    }
+  };
+  const verifyActive = async (ctx: ExtensionContext): Promise<boolean> => {
+    if (!ready || selectedModel !== modelKey(ctx) || !isLlamaServerContext(ctx, config)) return false;
+    try { await config.assertCurrent?.(); return true; }
+    catch { invalidate(); return false; }
+  };
 
   const activateSessionSlot = async (
     ctx: ExtensionContext,
@@ -113,6 +208,7 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
       (typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : undefined);
     const tools = toolsOverride;
     const res = await slotManager.ensureSlotForSession(sessionId, systemPrompt, tools);
+    config.signal?.throwIfAborted();
     sessionSlots.set(sessionId, res.slotId);
 
     if (res.restored) {
@@ -128,6 +224,8 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
       } catch {
         // UI unavailable
       }
+    } else if (res.warmed) {
+      try { if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(res.tokens ?? 0)} (S${res.slotId}) warmed 💾`); } catch {}
     } else if (res.hit) {
       try {
         if (ctx.hasUI) {
@@ -141,8 +239,9 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
   };
 
   // Hook 0: Bind outgoing provider requests directly to the allocated slot (STRICTLY for llama-server)
-  pi.on("before_provider_request", async (event, ctx: ExtensionContext) => {
+  on("before_provider_request", async (event, ctx: ExtensionContext) => {
     if (!isLlamaServerContext(ctx, config)) {
+      invalidate();
       if (event.payload && typeof event.payload === "object") {
         delete (event.payload as Record<string, unknown>).id_slot;
       }
@@ -160,7 +259,17 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
       (typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : undefined);
     const tools = payload?.tools;
 
-    const slotId = await activateSessionSlot(ctx, systemPrompt, tools);
+    if (!payload || typeof payload !== "object") return;
+    const request = payload as Record<string, any>;
+    request.chat_template_kwargs = { ...(request.chat_template_kwargs ?? {}), preserve_thinking: true };
+    if (!await refresh(ctx, request)) { delete request.id_slot; return; }
+    let slotId: number;
+    try {
+      slotId = await activateSessionSlot(ctx, systemPrompt, tools ?? []);
+      await config.assertCurrent?.();
+    } catch {
+      invalidate(); delete request.id_slot; return;
+    }
     if (event.payload && typeof event.payload === "object") {
       (event.payload as Record<string, unknown>).id_slot = slotId;
 
@@ -175,40 +284,26 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
   });
 
   // Hook 1: Session Start (Cold boot or resume)
-  pi.on("session_start", async (_event, ctx: ExtensionContext) => {
-    if (!isLlamaServerContext(ctx, config)) {
-      try { ctx.ui.setStatus(STATUS_KEY, undefined); } catch {}
-      return;
-    }
-    try {
-      await activateSessionSlot(ctx);
-    } catch (err) {
-      console.warn(`[pi-kv-cache-manager] Error in session_start handler:`, err);
-    }
+  on("session_start", async (_event, ctx: ExtensionContext) => {
+    invalidate();
+    try { ctx.ui.setStatus(STATUS_KEY, undefined); } catch {}
   });
+
+  on("session_switch", async () => { invalidate(); });
 
   // Hook 1.5: Before Agent Start (Persistent RPC & subsequent turns slot verification)
-  pi.on("before_agent_start", async (_event, ctx: ExtensionContext) => {
-    if (!isLlamaServerContext(ctx, config)) {
-      try { ctx.ui.setStatus(STATUS_KEY, undefined); } catch {}
-      return;
-    }
-    try {
-      await activateSessionSlot(ctx);
-    } catch (err) {
-      console.warn(`[pi-kv-cache-manager] Error in before_agent_start handler:`, err);
-    }
-  });
+  // Activation deliberately waits for before_provider_request: earlier hooks lack serialized tools.
 
   // Hook 2: Turn End (Incremental lazy checkpointing)
-  pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
-    if (!isLlamaServerContext(ctx, config)) {
+  on("turn_end", async (_event, ctx: ExtensionContext) => {
+    if (!await verifyActive(ctx)) {
       return;
     }
     try {
       const sessionId = ctx.sessionManager?.getSessionId();
       if (!sessionId) return;
-      const slotId = sessionSlots.get(sessionId) ?? config.slotId;
+      const slotId = sessionSlots.get(sessionId);
+      if (slotId === undefined) return;
 
       const usage = ctx.getContextUsage?.();
       const currentTokens = usage?.tokens || 0;
@@ -240,32 +335,24 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
   });
 
   // Hook 2.5: Model Select (Hide/show KV indicator dynamically when switching models)
-  pi.on("model_select", async (_event, ctx: ExtensionContext) => {
-    if (!isLlamaServerContext(ctx, config)) {
-      try {
-        ctx.ui.setStatus(STATUS_KEY, undefined);
-      } catch {}
-    } else {
-      try {
-        await activateSessionSlot(ctx);
-      } catch (err) {
-        console.warn(`[pi-kv-cache-manager] Error in model_select slot activation:`, err);
-      }
-    }
+  on("model_select", async (_event, ctx: ExtensionContext) => {
+    invalidate();
+    try { ctx.ui.setStatus(STATUS_KEY, undefined); } catch {}
   });
 
   // Hook 3: Session Shutdown (Cleanup UI status and slot session tracking)
-  pi.on("session_shutdown", async (_event, ctx: ExtensionContext) => {
+  on("session_shutdown", async (_event, ctx: ExtensionContext) => {
     try {
       const sessionId = ctx.sessionManager?.getSessionId();
       if (sessionId) {
-        slotManager.clearSession(sessionId);
+        slotManager?.clearSession(sessionId);
         sessionSlots.delete(sessionId);
       }
       ctx.ui.setStatus(STATUS_KEY, undefined);
     } catch {
       // Ignored
     }
+    invalidate();
   });
 
   // Slash Commands: /kv [status|save|restore|prune|base-update|help]
@@ -277,9 +364,17 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
         .filter((s) => s.startsWith(prefix.toLowerCase()))
         .map((s) => ({ value: s, label: s }));
     },
-    handler: async (rawArgs: string, ctx: ExtensionCommandContext) => {
+    handler: (rawArgs: string, ctx: ExtensionCommandContext) => {
+      const signal = lifetime.signal;
+      ctx = guardContext(ctx, signal);
+      return queue.run(async () => {
+      if (signal.aborted) return;
       const args = rawArgs.trim().split(/\s+/).filter(Boolean);
       const sub = (args[0] || "status").toLowerCase();
+      if (sub !== "help" && !await verifyActive(ctx)) {
+        notifyUser(ctx, "Persistent KV unavailable: send a request to a verified local llama-server first. No files changed.", "warning");
+        return;
+      }
 
       switch (sub) {
         case "status": {
@@ -309,7 +404,7 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
           ];
 
           try {
-            const liveSlots = await fetchSlots(config.llamaServerUrl);
+            const liveSlots = await fetchSlots(config.llamaServerUrl, config);
             lines.push("#### Live Server Slots:");
             lines.push("| Slot ID | Status | Active Snapshot | Last Used |");
             lines.push("| :---: | :---: | :--- | :---: |");
@@ -354,12 +449,15 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
           const sessionId = ctx.sessionManager?.getSessionId() || "manual";
           const slotId = sessionSlots.get(sessionId) ?? config.slotId;
           const filename = customName
-            ? `snap_${sanitizeFilename(customName)}.bin`
+            ? engine.getSnapshotFilename(customName)
             : engine.getSnapshotFilename(sessionId);
 
           try {
             notifyUser(ctx, `Saving KV snapshot (Slot ${slotId}) to \`${filename}\`...`, "info");
-            const resp = await saveSlot(config.llamaServerUrl, slotId, filename);
+            await config.assertCurrent?.();
+            await lru.invalidateSnapshot(filename);
+            const resp = await saveSlot(config.llamaServerUrl, slotId, filename, config);
+            await config.assertCurrent?.();
             const tokens = resp.n_saved ?? resp.n_tokens ?? 0;
             const bytes = resp.n_written ?? resp.n_bytes ?? 0;
             const saveMs = resp.timings?.save_ms ?? resp.t_ms ?? 0;
@@ -405,12 +503,16 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
           const sessionId = ctx.sessionManager?.getSessionId() || "manual";
           const slotId = sessionSlots.get(sessionId) ?? config.slotId;
           const filename = customName
-            ? (customName.endsWith(".bin") ? customName : `snap_${sanitizeFilename(customName)}.bin`)
+            ? engine.getSnapshotFilename(customName.replace(/\.bin$/, ""))
             : engine.getSnapshotFilename(sessionId);
 
           try {
             notifyUser(ctx, `Restoring KV snapshot (Slot ${slotId}) from \`${filename}\`...`, "info");
-            const resp = await restoreSlot(config.llamaServerUrl, slotId, filename);
+            const meta = await lru.readMetadata(path.join(config.cacheDir, filename.replace(/\.bin$/, ".meta.json")));
+            if (!meta) throw new Error("Snapshot is not bound to the current runtime/prefix");
+            await config.assertCurrent?.();
+            const resp = await restoreSlot(config.llamaServerUrl, slotId, filename, config);
+            await config.assertCurrent?.();
             await lru.touchSnapshot(filename);
             const tokens = resp.n_restored ?? resp.n_tokens ?? 0;
             const restoreMs = resp.timings?.restore_ms ?? resp.t_ms ?? 0;
@@ -461,8 +563,8 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
             notifyUser(ctx, "System prompt unavailable in this context.", "warning");
             return;
           }
-          const prompt = ctx.getSystemPrompt();
-          const tools = await baseCache.loadCachedTools();
+          if (!lastPrefix) return;
+          const { prompt, tools } = lastPrefix;
           const hash = computeHash(prompt, tools);
           try {
             notifyUser(ctx, "Prefilling system prompt and tools into an available slot...", "info");
@@ -496,6 +598,7 @@ export default function piKvCacheManager(pi: ExtensionAPI): void {
           break;
         }
       }
+    });
     },
   });
 }

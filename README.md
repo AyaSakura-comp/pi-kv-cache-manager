@@ -355,6 +355,34 @@ pi remove ~/src/pi-kv-cache-manager     # Uninstalls package
 
 ---
 
+## Server-authoritative snapshot discovery (v2)
+
+Persistent reuse is now resolved **at `before_provider_request`**, with the serialized system prompt and tools, not during early session/model hooks. Settings are reloaded using the current trusted cwd. The selected model's `baseUrl` selects the server; `kvCache.llamaServerUrl` cannot redirect another model to port 8001.
+
+On Linux, a single loopback HTTP listener must be provably owned by `llama-server`: bounded `ss -H -ltnpe` (execFile, no shell), `/proc/<pid>/fd` socket inode, executable, process start identity, network/mount namespaces and filesystem root. The explicit `--slot-save-path` (separate or `=` syntax, relative to the server cwd) is authoritative. Client `cacheDir` / `LLAMA_SLOT_SAVE_PATH` hints never override it. `/props` supplies model/runtime identity, **not** the snapshot directory; `/lora-adapters` must supply loaded adapter paths and scales.
+
+Files use a `kv2_<hash>_` filename prefix **in the server's directory**. The hash binds the model's canonical path and local stat identity, adapters/scales/stat identities, executable, launch arguments/environment, advertised defaults/build, auxiliary model/template files, and serialized system/tools/request options. Metadata must carry the same namespace. Existing unbound files are not imported, copied, trusted, or cleaned up. Golden filenames alone never imply a hit. Warmed and restored results are distinct. Server save/restore still uses filenames only, preserving its `.dft` handling.
+
+An existing worker replaces all managers and RAM/session tracking when the identity, directory, settings or process generation changes. Extension operations are serialized; checkpoints are awaited rather than detached. Runtime guards run around slot work, and an overwrite first tombstones its owned metadata so a stale/failed save cannot inherit a previous valid binding. Failed discovery disables extension-managed persistent reuse and `/kv` mutations; normal provider requests continue without an extension slot assignment. Missing binaries and restore failures are not grounds for deleting files.
+
+### Deliberate limits
+
+- Direct `http://localhost[:port]`, `http://127.0.0.1[:port]` and `http://[::1][:port]` endpoints, optionally `/v1`, are supported without configuration changes (including `http://localhost:8001/v1`). `localhost` DNS has a 2-second deadline; every answer must be exactly IPv4/IPv6 loopback. Empty/non-loopback answers or multiple listeners fail closed. Dual-stack loopback answers are allowed only with one verified listener. Requests retain the selected hostname, port and Host header; a Node HTTP transport pins the validated DNS answers rather than re-resolving between validation and connection. No alternate configured endpoint or redirect is used. Other DNS names, HTTPS, proxies/routers, containers/chroots, inaccessible `/proc`, missing explicit model/save-path flags, split GGUFs, and missing identity APIs fail closed. No remote disk management is promised.
+- HTTP deadlines include headers **and complete response bodies**: discovery 2 seconds, slot/template control calls 5 seconds, and potentially large golden prefills 300 seconds. Internal/embedded callers may override `controlTimeoutMs` / `prefillTimeoutMs` and supply an optional `signal`; these are not new user settings. AbortSignal is passed to the actual transport. A runtime timeout aborts that runtime; cold fallback cannot continue destructive work on it.
+- Model selection, session start/switch/shutdown, and a changed model/session on a provider request immediately abort active runtime I/O before waiting for the serialized queue. Queued old work is skipped, stale slot assignment/metadata publication/UI callbacks are guarded, and the next provider request can discover a fresh runtime. Cancellation cannot undo an operation already accepted by llama-server or a filesystem syscall already issued; failed saves retain pending metadata, not a valid snapshot. OS DNS lookup itself is not cancellable, but late answers cannot initiate requests or mutate runtime state. CPU fixtures cover cancellation; real server behavior remains a separate parent live-test.
+- Per-request LoRA/adapter overrides fail closed; change server adapters/scales instead. A single string-valued leading system message is required. Later extensions can still rewrite a payload: put this extension after payload-mutating extensions.
+- Stat identity uses device/inode/size/mtime/ctime, **not weight-file hashing**. Files must remain immutable while loaded; restart the server after replacing model/adapter/auxiliary files. This is not a content-addressed or adversarial tamper guarantee.
+- External server/adapter changes cannot be transactionally locked by the current API. Guards detect observed changes and discard stale metadata, but cannot prevent an external change in the final check-to-request gap. Independent Pi processes do not share a slot lease/lock.
+- Quotas apply only to the active namespace. Old namespaces and legacy caches are intentionally retained; this is not a global disk quota across model/prompt histories. `/kv` mutations require a previously verified full provider request; named restores are namespace-bound, not arbitrary filename imports.
+
+### CPU regression tests
+
+```bash
+npm test
+```
+
+Uses the existing TypeScript compiler and Node's built-in test runner. Tests isolate HOME before loading modules, forbid unfixture'd fetches, and use temporary `/proc`/listener/API fixtures; no server, GPU or network access is needed.
+
 ## ⚙️ Configuration
 
 Configuration is loaded from `~/.pi/agent/settings.json` (global) or `.pi/settings.json` (project-local):
@@ -379,9 +407,9 @@ Configuration is loaded from `~/.pi/agent/settings.json` (global) or `.pi/settin
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `llamaServerUrl` | `string` | `http://127.0.0.1:8001` | Base URL for llama-server HTTP API |
+| `llamaServerUrl` | `string` | `http://127.0.0.1:8001` | Legacy hint; runtime uses the selected model's verified endpoint |
 | `slotId` | `number` | `0` | Active llama.cpp slot ID to manage |
-| `cacheDir` | `string` | `~/.cache/llama-slots` | Storage directory for KV snapshots and metadata sidecars |
+| `cacheDir` | `string` | `~/.cache/llama-slots` | Legacy hint; runtime uses the verified server's slot-save-path |
 | `maxSessions` | `number` | `30` | Maximum number of session snapshots before LRU eviction |
 | `maxDiskUsageGb` | `number` | `40` | Hard disk quota in Gigabytes before LRU eviction |
 | `minTokensThreshold` | `number` | `3000` | Minimum token count before automatic turn snapshots activate |

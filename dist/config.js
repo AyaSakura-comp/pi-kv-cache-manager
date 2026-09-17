@@ -37,15 +37,6 @@ export function loadConfig(cwd) {
         ...DEFAULT_CONFIG,
         ...userConfig,
     };
-    // Ensure cache directory exists
-    if (!fs.existsSync(merged.cacheDir)) {
-        try {
-            fs.mkdirSync(merged.cacheDir, { recursive: true });
-        }
-        catch {
-            // Best-effort directory creation
-        }
-    }
     return merged;
 }
 //# sourceMappingURL=config.js.map

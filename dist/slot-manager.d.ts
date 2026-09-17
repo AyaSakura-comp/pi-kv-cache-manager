@@ -6,6 +6,7 @@ export interface SlotResolutionResult {
     slotId: number;
     hit: boolean;
     restored: boolean;
+    warmed?: boolean;
     isBase?: boolean;
     tokens?: number;
     durationMs?: number;

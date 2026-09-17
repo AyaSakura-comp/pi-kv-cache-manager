@@ -1,3 +1,4 @@
+import { boundedFetch, checkCancelled } from "./request.js";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
@@ -9,7 +10,7 @@ export const BASE_SNAPSHOT_BIN = "base_system_prompt.bin";
 export const BASE_SNAPSHOT_META = "base_system_prompt.meta.json";
 export const BASE_TOOLS_JSON = "base_tools.json";
 
-function stableStringify(obj: unknown): string {
+export function stableStringify(obj: unknown): string {
   if (obj === null || typeof obj !== "object") {
     return JSON.stringify(obj);
   }
@@ -45,16 +46,20 @@ export class BaseCacheManager {
     this.lru = lru;
   }
 
+  getFilename(): string {
+    return `${this.config.snapshotPrefix ?? ""}${BASE_SNAPSHOT_BIN}`;
+  }
+
   getMetaPath(): string {
-    return path.join(this.config.cacheDir, BASE_SNAPSHOT_META);
+    return path.join(this.config.cacheDir, this.getFilename().replace(/\.bin$/, ".meta.json"));
   }
 
   getBinPath(): string {
-    return path.join(this.config.cacheDir, BASE_SNAPSHOT_BIN);
+    return path.join(this.config.cacheDir, this.getFilename());
   }
 
   getToolsPath(): string {
-    return path.join(this.config.cacheDir, BASE_TOOLS_JSON);
+    return path.join(this.config.cacheDir, `${this.config.snapshotPrefix ?? ""}${BASE_TOOLS_JSON}`);
   }
 
   async loadCachedTools(): Promise<unknown[] | undefined> {
@@ -62,16 +67,19 @@ export class BaseCacheManager {
       const raw = await fs.readFile(this.getToolsPath(), "utf-8");
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-    } catch {
+    } catch (error) {
+      checkCancelled(this.config, error);
       // Ignored
     }
     return undefined;
   }
 
   async saveCachedTools(tools: unknown[]): Promise<void> {
+    checkCancelled(this.config);
     try {
-      await fs.writeFile(this.getToolsPath(), JSON.stringify(tools, null, 2), "utf-8");
-    } catch {
+      await fs.writeFile(this.getToolsPath(), JSON.stringify(tools, null, 2), { encoding: "utf-8", signal: this.config.signal });
+    } catch (error) {
+      checkCancelled(this.config, error);
       // Ignored
     }
   }
@@ -108,18 +116,23 @@ export class BaseCacheManager {
     // Verify bin file exists
     try {
       await fs.access(this.getBinPath());
-    } catch {
+    } catch (error) {
+      checkCancelled(this.config, error);
       return { status: "miss", hash: currentHash };
     }
 
     try {
+      checkCancelled(this.config);
+      await this.config.assertCurrent?.();
       const resp = await restoreSlot(
         this.config.llamaServerUrl,
         slotId,
-        BASE_SNAPSHOT_BIN
+        this.getFilename(), this.config
       );
 
-      await this.lru.touchSnapshot(BASE_SNAPSHOT_BIN);
+      checkCancelled(this.config);
+      await this.config.assertCurrent?.();
+      await this.lru.touchSnapshot(this.getFilename());
 
       return {
         status: "hit",
@@ -128,19 +141,13 @@ export class BaseCacheManager {
         durationMs: resp.timings?.restore_ms ?? resp.t_ms ?? 0,
       };
     } catch (err) {
+      checkCancelled(this.config, err);
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(
-        `[pi-kv-cache-manager] Failed to restore base snapshot (${msg}), invalidating incompatible cache...`
+        `[pi-kv-cache-manager] Failed to restore base snapshot (${msg}); preserving files and trying a fresh warm...`
       );
-      try {
-        await fs.unlink(this.getBinPath());
-      } catch {}
-      try {
-        await fs.unlink(this.getBinPath() + ".dft");
-      } catch {}
-      try {
-        await fs.unlink(this.getMetaPath());
-      } catch {}
+      // An HTTP/discovery failure is not evidence that the snapshot is corrupt.
+      // Leave binaries and MTP sidecars untouched; a later successful warm may replace them.
       return { status: "miss", hash: currentHash, error: msg };
     }
   }
@@ -157,6 +164,8 @@ export class BaseCacheManager {
     preferredSlotId?: number,
     tools?: unknown[]
   ): Promise<{ tokens: number; durationMs: number; bytes: number; slotId: number }> {
+    checkCancelled(this.config);
+    await this.config.assertCurrent?.();
     const baseUrl = this.config.llamaServerUrl.replace(/\/+$/, "");
 
     let effectiveTools = tools;
@@ -171,10 +180,11 @@ export class BaseCacheManager {
     let targetSlot = preferredSlotId;
     if (targetSlot === undefined) {
       try {
-        const slots = await fetchSlots(this.config.llamaServerUrl);
+        const slots = await fetchSlots(this.config.llamaServerUrl, this.config);
         const idleSlot = slots.find((s) => !s.is_processing);
         targetSlot = idleSlot ? idleSlot.id : this.config.slotId;
-      } catch {
+      } catch (error) {
+        checkCancelled(this.config, error);
         targetSlot = this.config.slotId;
       }
     }
@@ -184,37 +194,40 @@ export class BaseCacheManager {
     try {
       const templatePayload: Record<string, unknown> = {
         messages: [{ role: "system", content: systemPrompt }],
+        ...this.config.templateOptions,
         add_generation_prompt: false,
       };
       if (effectiveTools && Array.isArray(effectiveTools) && effectiveTools.length > 0) {
         templatePayload.tools = effectiveTools;
       }
 
-      const templateRes = await fetch(`${baseUrl}/apply-template`, {
+      const templateRes = await boundedFetch(`${baseUrl}/apply-template`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(templatePayload),
-      });
-      if (templateRes.ok) {
-        const data = (await templateRes.json()) as { prompt?: string };
-        if (data.prompt) {
-          formattedPrompt = data.prompt;
-        }
-      }
-    } catch {
-      // Fallback to raw systemPrompt if /apply-template is unavailable
+      }, this.config);
+      if (!templateRes.ok) throw new Error("Chat template unavailable");
+      const data = (await templateRes.json()) as { prompt?: string };
+      if (typeof data.prompt !== "string") throw new Error("Missing formatted prefix");
+      formattedPrompt = data.prompt;
+    } catch (error) {
+      // Never label raw, untemplated tokens as a valid golden prefix.
+      throw error;
     }
+    checkCancelled(this.config);
+    await this.config.assertCurrent?.();
 
     // 3. Erase target slot first to guarantee a pure, clean prefill (no leftover tokens)
     try {
-      await eraseSlot(this.config.llamaServerUrl, targetSlot);
-    } catch {
+      await eraseSlot(this.config.llamaServerUrl, targetSlot, this.config);
+    } catch (error) {
+      checkCancelled(this.config, error);
       // Ignore if slot was already clean
     }
 
     // 4. Evaluate formatted prompt with n_predict = 0 to fill slot KV cache
     const completionUrl = `${baseUrl}/completion`;
-    const evalRes = await fetch(completionUrl, {
+    const evalRes = await boundedFetch(completionUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -223,7 +236,7 @@ export class BaseCacheManager {
         id_slot: targetSlot,
         cache_prompt: true,
       }),
-    });
+    }, this.config, true);
 
     if (!evalRes.ok) {
       const text = await evalRes.text();
@@ -231,11 +244,16 @@ export class BaseCacheManager {
     }
 
     // 5. Snapshot the prefilled slot to base_system_prompt.bin
+    checkCancelled(this.config);
+    await this.config.assertCurrent?.();
+    await this.lru.invalidateSnapshot(this.getFilename());
     const saveResp = await saveSlot(
       this.config.llamaServerUrl,
       targetSlot,
-      BASE_SNAPSHOT_BIN
+      this.getFilename(), this.config
     );
+    checkCancelled(this.config);
+    await this.config.assertCurrent?.();
 
     const now = new Date().toISOString();
     const savedTokens = saveResp.n_saved ?? saveResp.n_tokens ?? 0;

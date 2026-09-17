@@ -3,6 +3,7 @@ import { LruManager } from "./lru-manager.js";
 export declare const BASE_SNAPSHOT_BIN = "base_system_prompt.bin";
 export declare const BASE_SNAPSHOT_META = "base_system_prompt.meta.json";
 export declare const BASE_TOOLS_JSON = "base_tools.json";
+export declare function stableStringify(obj: unknown): string;
 export declare function computeHash(content: string, tools?: unknown[]): string;
 export interface BaseCacheRestoreResult {
     status: "hit" | "miss" | "disabled" | "error";
@@ -15,6 +16,7 @@ export declare class BaseCacheManager {
     private config;
     private lru;
     constructor(config: KvManagerConfig, lru: LruManager);
+    getFilename(): string;
     getMetaPath(): string;
     getBinPath(): string;
     getToolsPath(): string;

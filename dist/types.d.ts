@@ -1,7 +1,13 @@
+import type { RequestOptions } from "./request.js";
 /**
  * Type definitions for pi-kv-cache-manager
  */
-export interface KvManagerConfig {
+export interface KvManagerConfig extends RequestOptions {
+    /** Internal server + full request-prefix namespace; never loaded from user settings. */
+    snapshotPrefix?: string;
+    runtimeIdentity?: string;
+    templateOptions?: Record<string, unknown>;
+    assertCurrent?: () => Promise<void>;
     /** Base URL for llama-server HTTP API (default: http://127.0.0.1:8001) */
     llamaServerUrl: string;
     /** Active llama.cpp slot ID to manage (default: 0) */
@@ -22,6 +28,7 @@ export interface KvManagerConfig {
     enableIncrementalSave: boolean;
 }
 export interface SnapshotMetadata {
+    namespace?: string;
     sessionId: string;
     sessionName?: string;
     tokenCount: number;

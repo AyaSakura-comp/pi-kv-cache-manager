@@ -13,8 +13,14 @@ export class LruManager {
   private cacheDir: string;
   private evictionsCount: number = 0;
 
-  constructor(cacheDir: string) {
+  constructor(cacheDir: string, private namespace = "", private signal?: AbortSignal) {
     this.cacheDir = cacheDir;
+  }
+
+  async invalidateSnapshot(filename: string): Promise<void> {
+    // Tombstone before an overwrite: a failed/stale save must not inherit old valid metadata.
+    this.signal?.throwIfAborted();
+    await fs.writeFile(path.join(this.cacheDir, filename.replace(/\.bin$/, ".meta.json")), '{"pending":true}', "utf8");
   }
 
   getEvictionsCount(): number {
@@ -24,7 +30,9 @@ export class LruManager {
   async readMetadata(metaPath: string): Promise<SnapshotMetadata | null> {
     try {
       const data = await fs.readFile(metaPath, "utf-8");
-      return JSON.parse(data) as SnapshotMetadata;
+      const meta = JSON.parse(data);
+      if (meta.pending || (this.namespace && (meta.namespace !== this.namespace || !path.basename(metaPath).startsWith(this.namespace)))) return null;
+      return meta as SnapshotMetadata;
     } catch {
       return null;
     }
@@ -33,7 +41,9 @@ export class LruManager {
   async writeMetadata(metaPath: string, meta: SnapshotMetadata): Promise<void> {
     try {
       const tmpPath = `${metaPath}.tmp.${Date.now()}`;
-      await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2), "utf-8");
+      this.signal?.throwIfAborted();
+      await fs.writeFile(tmpPath, JSON.stringify({ ...meta, namespace: this.namespace }, null, 2), "utf-8");
+      this.signal?.throwIfAborted();
       await fs.rename(tmpPath, metaPath);
     } catch (err) {
       console.error(`[pi-kv-cache-manager] Failed to write metadata to ${metaPath}:`, err);
@@ -58,7 +68,7 @@ export class LruManager {
     try {
       const files = await fs.readdir(this.cacheDir);
       for (const file of files) {
-        if (file.endsWith(".meta.json")) {
+        if (file.startsWith(this.namespace) && file.endsWith(".meta.json")) {
           const metaPath = path.join(this.cacheDir, file);
           const binFilename = file.replace(/\.meta\.json$/, ".bin");
           const binPath = path.join(this.cacheDir, binFilename);
@@ -71,8 +81,7 @@ export class LruManager {
               meta.fileSizeBytes = stat.size;
               items.push({ meta, binFilename, binPath, metaPath });
             } catch {
-              // Orphaned metadata file without corresponding .bin
-              await fs.unlink(metaPath).catch(() => {});
+              // Missing/inaccessible binaries are not proof of an orphan. Never delete on inspection.
             }
           }
         }
@@ -116,9 +125,14 @@ export class LruManager {
       if (!oldest) break;
 
       try {
+        this.signal?.throwIfAborted();
         await fs.unlink(oldest.binPath);
+        this.signal?.throwIfAborted();
         await fs.unlink(oldest.metaPath);
+        this.signal?.throwIfAborted();
         await fs.unlink(`${oldest.binPath}.media.json`).catch(() => {});
+        this.signal?.throwIfAborted();
+        await fs.unlink(`${oldest.binPath}.dft`).catch(() => {});
         prunedFiles.push(oldest.binFilename);
         freedBytes += oldest.meta.fileSizeBytes;
         totalBytes -= oldest.meta.fileSizeBytes;

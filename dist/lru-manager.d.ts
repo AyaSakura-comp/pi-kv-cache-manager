@@ -6,9 +6,12 @@ export interface SnapshotItem {
     metaPath: string;
 }
 export declare class LruManager {
+    private namespace;
+    private signal?;
     private cacheDir;
     private evictionsCount;
-    constructor(cacheDir: string);
+    constructor(cacheDir: string, namespace?: string, signal?: AbortSignal | undefined);
+    invalidateSnapshot(filename: string): Promise<void>;
     getEvictionsCount(): number;
     readMetadata(metaPath: string): Promise<SnapshotMetadata | null>;
     writeMetadata(metaPath: string, meta: SnapshotMetadata): Promise<void>;
