@@ -75,10 +75,18 @@ export class LruManager {
 
           const meta = await this.readMetadata(metaPath);
           if (meta) {
-            // Check if bin file actually exists on disk
+            // Check if the binary exists and account for all server-owned sidecars.
             try {
               const stat = await fs.stat(binPath);
-              meta.fileSizeBytes = stat.size;
+              let snapshotBytes = stat.size;
+              for (const suffix of [".dft", ".ckpt", ".media.json"]) {
+                try {
+                  snapshotBytes += (await fs.stat(`${binPath}${suffix}`)).size;
+                } catch {
+                  // Optional sidecar is absent.
+                }
+              }
+              meta.fileSizeBytes = snapshotBytes;
               items.push({ meta, binFilename, binPath, metaPath });
             } catch {
               // Missing/inaccessible binaries are not proof of an orphan. Never delete on inspection.
@@ -127,12 +135,12 @@ export class LruManager {
       try {
         this.signal?.throwIfAborted();
         await fs.unlink(oldest.binPath);
+        for (const suffix of [".media.json", ".dft", ".ckpt"]) {
+          this.signal?.throwIfAborted();
+          await fs.unlink(`${oldest.binPath}${suffix}`).catch(() => {});
+        }
         this.signal?.throwIfAborted();
         await fs.unlink(oldest.metaPath);
-        this.signal?.throwIfAborted();
-        await fs.unlink(`${oldest.binPath}.media.json`).catch(() => {});
-        this.signal?.throwIfAborted();
-        await fs.unlink(`${oldest.binPath}.dft`).catch(() => {});
         prunedFiles.push(oldest.binFilename);
         freedBytes += oldest.meta.fileSizeBytes;
         totalBytes -= oldest.meta.fileSizeBytes;

@@ -307,6 +307,11 @@ sequenceDiagram
    - Fixes upstream Qwen Jinja Chat Template behavior when `preserve_thinking: true`. If reasoning is absent or empty in assistant turns, the default template incorrectly injects `<think>\n\n</think>\n\n` (rogue token 271), causing prefix divergence from the raw KV cache and wiping 50k+ tokens on every subsequent turn.
    - Guards slot save against stale `.media.json` residue, validates media chunk bounds on restore, and calculates checkpoint `pos_max` using `llama_memory_seq_pos_max` to prevent M-RoPE position assertion crashes (`X < Y`).
 
+9. **Hybrid/Recurrent Checkpoint Persistence (`patches/0004-...`)**:
+   - Persists in-memory prompt checkpoints to a `.bin.ckpt` sidecar and restores them with the target and MTP draft states.
+   - Lets SWA/GDN models roll back across prompt-tail retokenization instead of discarding the restored snapshot and fully prefilling the conversation.
+   - LRU accounting and eviction include `.dft`, `.ckpt`, and `.media.json` sidecars.
+
 ---
 
 ## 📦 Installation
@@ -316,6 +321,7 @@ sequenceDiagram
 git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0001-allow-text-slot-save-restore-with-mmproj.patch
 git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0002-sync-mtp-draft-kv-cache-slots.patch
 git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0003-fix-qwen-preserve-thinking-and-slot-pos-max.patch
+git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0004-persist-context-checkpoints.patch
 cmake --build /path/to/llama.cpp/build --target llama-server -j$(nproc)
 ```
 
@@ -453,7 +459,8 @@ pi-kv-cache-manager/
 ├── patches/
 │   ├── 0001-allow-text-slot-save-restore-with-mmproj.patch # Upstream PR patch for llama.cpp
 │   ├── 0002-sync-mtp-draft-kv-cache-slots.patch           # Dual-track MTP draft KV sync & checkpoint fix
-│   └── 0003-fix-qwen-preserve-thinking-and-slot-pos-max.patch # Qwen template & slot checkpoint alignment
+│   ├── 0003-fix-qwen-preserve-thinking-and-slot-pos-max.patch # Qwen template & slot checkpoint alignment
+│   └── 0004-persist-context-checkpoints.patch             # Hybrid/SWA checkpoint sidecar persistence
 └── src/
     ├── index.ts                # Pi Agent Extension Entry Point, Hooks & Command Wiring
     ├── config.ts               # Configuration Loader & Defaults (30 sessions / 40GB)

@@ -59,6 +59,30 @@ test('LRU does not remove legacy or orphan metadata and preserves unrelated side
   assert.equal(await fs.readFile(orphan,'utf8'),'{}');
 });
 
+test('LRU disk usage includes checkpoint, draft, and media sidecars',async t=>{
+  const f=await fixture(t); const lru=new LruManager(f.config.cacheDir,f.config.snapshotPrefix);
+  const filename=`${f.config.snapshotPrefix}usage.bin`;
+  for (const [suffix,size] of [['',3],['.dft',5],['.ckpt',7],['.media.json',2]]) {
+    await fs.writeFile(path.join(f.config.cacheDir,filename+suffix),Buffer.alloc(size));
+  }
+  await lru.writeMetadata(path.join(f.config.cacheDir,filename.replace(/\.bin$/,'.meta.json')),
+    {sessionId:'usage',tokenCount:1,fileSizeBytes:0,createdAt:new Date(0).toISOString(),lastAccessedAt:new Date(0).toISOString(),promptPrefixHash:'x'});
+  const [snapshot]=await lru.listSnapshots();
+  assert.equal(snapshot.meta.fileSizeBytes,17);
+});
+
+test('LRU eviction removes checkpoint sidecar with its snapshot',async t=>{
+  const f=await fixture(t); const lru=new LruManager(f.config.cacheDir,f.config.snapshotPrefix);
+  const filename=`${f.config.snapshotPrefix}evict.bin`;
+  const paths=['','.dft','.ckpt','.media.json'].map(suffix=>path.join(f.config.cacheDir,filename+suffix));
+  for (const file of paths) await fs.writeFile(file,'x');
+  await lru.writeMetadata(path.join(f.config.cacheDir,filename.replace(/\.bin$/,'.meta.json')),
+    {sessionId:'evict',tokenCount:1,fileSizeBytes:0,createdAt:new Date(0).toISOString(),lastAccessedAt:new Date(0).toISOString(),promptPrefixHash:'x'});
+  const result=await lru.enforceLRU({...f.config,maxSessions:0});
+  assert.equal(result.freedBytes,4);
+  for (const file of paths) await assert.rejects(fs.access(file));
+});
+
 test('configuration loading has no filesystem side effects and honors cwd',async t=>{
   const f=await fixture(t); await fs.mkdir(path.join(f.root,'.pi'));
   const missing=path.join(f.root,'must-not-create');

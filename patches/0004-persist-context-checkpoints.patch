@@ -1,0 +1,132 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 09cb5817e..c0125260f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1844,6 +1844,90 @@ private:
+         return true;
+     }
+
++    // Context checkpoints are process-local and are not included in the main
++    // llama_state_seq file. Persist them separately so a restored hybrid model
++    // can roll back across prompt-tail retokenization instead of re-prefilling.
++    static bool checkpoints_save_sidecar(
++            const std::list<common_prompt_checkpoint> & checkpoints,
++            const std::string & filepath) {
++        FILE * f = fopen(filepath.c_str(), "wb");
++        if (f == nullptr) {
++            return false;
++        }
++
++        const uint32_t magic   = 0x4C434B50; // "PKCL"
++        const uint32_t version = 1;
++        const uint32_t count   = (uint32_t) checkpoints.size();
++        bool ok = fwrite(&magic, sizeof(magic), 1, f) == 1 &&
++                  fwrite(&version, sizeof(version), 1, f) == 1 &&
++                  fwrite(&count, sizeof(count), 1, f) == 1;
++
++        for (const auto & cur : checkpoints) {
++            const uint64_t n_tgt = cur.data_tgt.size();
++            const uint64_t n_dft = cur.data_dft.size();
++
++            ok = ok && fwrite(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) == 1;
++            ok = ok && fwrite(&cur.pos_min, sizeof(cur.pos_min), 1, f) == 1;
++            ok = ok && fwrite(&cur.pos_max, sizeof(cur.pos_max), 1, f) == 1;
++            ok = ok && fwrite(&n_tgt, sizeof(n_tgt), 1, f) == 1;
++            ok = ok && fwrite(&n_dft, sizeof(n_dft), 1, f) == 1;
++            ok = ok && (n_tgt == 0 || fwrite(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
++            ok = ok && (n_dft == 0 || fwrite(cur.data_dft.data(), 1, n_dft, f) == n_dft);
++        }
++
++        ok = fclose(f) == 0 && ok;
++        if (!ok) {
++            std::remove(filepath.c_str());
++        }
++        return ok;
++    }
++
++    static bool checkpoints_load_sidecar(
++            std::list<common_prompt_checkpoint> & checkpoints,
++            const std::string & filepath) {
++        FILE * f = fopen(filepath.c_str(), "rb");
++        if (f == nullptr) {
++            return false;
++        }
++
++        uint32_t magic = 0;
++        uint32_t version = 0;
++        uint32_t count = 0;
++        bool ok = fread(&magic, sizeof(magic), 1, f) == 1 &&
++                  fread(&version, sizeof(version), 1, f) == 1 &&
++                  fread(&count, sizeof(count), 1, f) == 1 &&
++                  magic == 0x4C434B50 && version == 1 && count <= 1024;
++
++        std::list<common_prompt_checkpoint> loaded;
++        for (uint32_t i = 0; ok && i < count; ++i) {
++            auto & cur = loaded.emplace_back();
++            uint64_t n_tgt = 0;
++            uint64_t n_dft = 0;
++
++            ok = ok && fread(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) == 1;
++            ok = ok && fread(&cur.pos_min, sizeof(cur.pos_min), 1, f) == 1;
++            ok = ok && fread(&cur.pos_max, sizeof(cur.pos_max), 1, f) == 1;
++            ok = ok && fread(&n_tgt, sizeof(n_tgt), 1, f) == 1;
++            ok = ok && fread(&n_dft, sizeof(n_dft), 1, f) == 1;
++            ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34);
++
++            if (ok) {
++                cur.data_tgt.resize(n_tgt);
++                cur.data_dft.resize(n_dft);
++                ok = ok && (n_tgt == 0 || fread(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
++                ok = ok && (n_dft == 0 || fread(cur.data_dft.data(), 1, n_dft, f) == n_dft);
++            }
++        }
++
++        fclose(f);
++        if (!ok || loaded.empty()) {
++            return false;
++        }
++
++        checkpoints = std::move(loaded);
++        return true;
++    }
++
+     // n_tokens_cur: the number of tokens added to the batch for the current slot
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+@@ -2022,6 +2106,15 @@ private:
+                         llama_state_seq_save_file(ctx_dft.get(), (filepath + ".dft").c_str(), slot->id, tokens.data(), token_count);
+                     }
+
++                    const std::string checkpoint_path = filepath + ".ckpt";
++                    if (slot->prompt.checkpoints.empty()) {
++                        std::remove(checkpoint_path.c_str());
++                    } else if (checkpoints_save_sidecar(slot->prompt.checkpoints, checkpoint_path)) {
++                        SLT_INF(*slot, "saved %zu context checkpoints to sidecar\n", slot->prompt.checkpoints.size());
++                    } else {
++                        SLT_WRN(*slot, "failed to write checkpoint sidecar %s\n", checkpoint_path.c_str());
++                    }
++
+                     if (slot->prompt.tokens.has_media()) {
+                         json media_meta = json::array();
+                         for (const auto & it : slot->prompt.tokens.get_media_map()) {
+@@ -2152,10 +2245,16 @@ private:
+
+                     slot->prompt.checkpoints.clear();
+                     if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
+-                        const llama_pos pos_max_mem = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+-                        const llama_pos pos_max_tok = slot->prompt.tokens.empty() ? 0 : slot->prompt.tokens.pos_next() - 1;
+-                        const llama_pos pos_max = std::max((llama_pos)0, std::max(pos_max_mem, pos_max_tok));
+-                        create_checkpoint(*slot, 0, 0, pos_max);
++                        if (checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
++                            SLT_INF(*slot, "restored %zu context checkpoints from sidecar\n", slot->prompt.checkpoints.size());
++                        } else {
++                            // Backward-compatible fallback for snapshots created before checkpoint
++                            // sidecars. This supports exact continuations but not prompt-tail rollback.
++                            const llama_pos pos_max_mem = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
++                            const llama_pos pos_max_tok = slot->prompt.tokens.empty() ? 0 : slot->prompt.tokens.pos_next() - 1;
++                            const llama_pos pos_max = std::max((llama_pos)0, std::max(pos_max_mem, pos_max_tok));
++                            create_checkpoint(*slot, 0, 0, pos_max);
++                        }
+                     }
+
+                     const int64_t t_end = ggml_time_us();
