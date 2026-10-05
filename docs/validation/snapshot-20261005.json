@@ -1,0 +1,55 @@
+{
+  "date": "2026-10-05",
+  "timezone": "Asia/Taipei",
+  "source_baseline": {
+    "kv_code_commit": "0eb4ee699059f86776d5f7a54ad8253a9d6ead4d",
+    "pi_core_commit": "25402dcbb3ddd5da46a5ae23b411c4339c731397",
+    "pi_publication_ref": "feat/kv-snapshot-deps-20261005",
+    "server_commit": "16f213bba98a83a2e73bd967d565db4f8f696c4f",
+    "server_publication_ref": "flashhead-lm-head"
+  },
+  "release_verification": {
+    "kv_cpu_tests_passed": 63,
+    "kv_cpu_tests_failed": 0,
+    "pi_targeted_tests_passed": 29,
+    "pi_targeted_tests_failed": 0,
+    "pi_full_static_check": "passed",
+    "static_security_and_parent_diff_review": "performed",
+    "independent_reviewer": false,
+    "clean_source_server_build": false,
+    "clean_source_live_rerun": false,
+    "service_restart_or_redeploy": false
+  },
+  "earlier_deployed_live_test": {
+    "artifact_directory_name": "four-session-20261005-2035-ten-rounds",
+    "persistent_rpc_processes": 4,
+    "server_slots": 2,
+    "approximate_prompt_tokens": 40000,
+    "seed": 4242,
+    "selection": "random sequential; no consecutive repeated session",
+    "excluded_priming_rounds": 4,
+    "rounds": 10,
+    "correct_rounds": 10,
+    "long_prefix_hit_rounds": 10,
+    "model_requests": 20,
+    "long_prefix_hit_requests": 20,
+    "disk_restore_rounds": 6,
+    "ram_resident_rounds": 4,
+    "min_reuse_percent": 99.417,
+    "max_prefilled_tokens": 237,
+    "tool_continuation_prefill_tokens": [93, 102],
+    "ttft_median_s": 0.763,
+    "ttft_max_s": 0.937,
+    "round_total_median_s": 2.666,
+    "round_total_max_s": 3.031,
+    "tools": ["read", "bash"],
+    "basis": "server n_past/prompt eval and provider cacheRead; session recall and changed fixture values",
+    "limits": "Deployed dirty-working-tree client integration, before the release LRU guard; not a clean rebuild, simultaneous-prompt test, live web-search test or background-writer proof."
+  },
+  "deployed_binary_inspected_after_live_test": {
+    "relative_path": "llama-mtp-deploy/gfx1151-gdnfused-503855413-20260926/bin/llama-server",
+    "sha256": "bd849d58ac8ec4b4b7b3fd2c86f45717d0e33bdbe02002063024cf6f82ad2eaf",
+    "complete_commit_build_mapping_verified": false,
+    "contemporaneous_with_live_test": false
+  }
+}

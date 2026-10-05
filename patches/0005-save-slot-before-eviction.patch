@@ -1,0 +1,252 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c0125260f..883880465 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -111,6 +111,13 @@ struct server_slot {
+ 
+     std::string snapshot_filename;
+ 
++    // Snapshot file the slot's live context belongs to, named by the client per request
++    // ("slot_snapshot"). While dirty (decoded since its last save/restore), the slot is
++    // saved there before another context replaces it, so switching sessions never
++    // discards state the client has not yet persisted.
++    std::string owner_snapshot;
++    bool owner_dirty = false;
++
+     // state
+     slot_state state = SLOT_STATE_IDLE;
+ 
+@@ -684,6 +691,81 @@ private:
+         llama_batch_free(batch);
+     }
+ 
++    // write the slot's context (target + draft state, checkpoints, media map) to a snapshot file
++    size_t slot_save_file(server_slot & slot, const std::string & filename, const std::string & filepath) {
++        const size_t token_count = slot.prompt.tokens.size();
++        const llama_tokens & tokens = slot.prompt.tokens.get_tokens();
++        const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot.id, tokens.data(), token_count);
++        if (ctx_dft) {
++            llama_state_seq_save_file(ctx_dft.get(), (filepath + ".dft").c_str(), slot.id, tokens.data(), token_count);
++        }
++
++        const std::string checkpoint_path = filepath + ".ckpt";
++        if (slot.prompt.checkpoints.empty()) {
++            std::remove(checkpoint_path.c_str());
++        } else if (checkpoints_save_sidecar(slot.prompt.checkpoints, checkpoint_path)) {
++            SLT_INF(slot, "saved %zu context checkpoints to sidecar\n", slot.prompt.checkpoints.size());
++        } else {
++            SLT_WRN(slot, "failed to write checkpoint sidecar %s\n", checkpoint_path.c_str());
++        }
++
++        if (slot.prompt.tokens.has_media()) {
++            json media_meta = json::array();
++            for (const auto & it : slot.prompt.tokens.get_media_map()) {
++                const size_t idx = it.first;
++                const auto & chunk = it.second;
++                if (!chunk) continue;
++                json entry;
++                entry["idx"] = idx;
++                entry["type"] = (int)mtmd_input_chunk_get_type(chunk.get());
++                const char * cid = mtmd_input_chunk_get_id(chunk.get());
++                entry["id"] = cid ? std::string(cid) : "";
++                entry["n_tokens"] = mtmd_input_chunk_get_n_tokens(chunk.get());
++                entry["n_pos"] = (int64_t)mtmd_input_chunk_get_n_pos(chunk.get());
++                const auto * img_tok = mtmd_input_chunk_get_tokens_image(chunk.get());
++                if (img_tok) {
++                    entry["nx"] = (uint32_t)mtmd_image_tokens_get_nx(img_tok);
++                    entry["ny"] = (uint32_t)mtmd_image_tokens_get_ny(img_tok);
++                    entry["pos_type"] = mtmd_image_tokens_get_pos_type(img_tok);
++                    entry["image_idx"] = mtmd_image_tokens_get_image_idx(img_tok);
++                }
++                media_meta.push_back(entry);
++            }
++            std::ofstream ofs(filepath + ".media.json");
++            if (ofs.is_open()) {
++                ofs << media_meta.dump(2);
++                ofs.close();
++            }
++        } else {
++            std::remove((filepath + ".media.json").c_str());
++        }
++
++        slot.snapshot_filename = filename;
++        slot.t_last_used = ggml_time_us();
++        if (filename == slot.owner_snapshot) {
++            slot.owner_dirty = false;
++        }
++
++        return nwrite;
++    }
++
++    // Before the slot's context is replaced by one that does not belong to `incoming`,
++    // persist unsaved state to the owner's snapshot.
++    void slot_flush_owner(server_slot & slot, const std::string & incoming) {
++        if (slot.owner_snapshot.empty() || slot.owner_snapshot == incoming) {
++            return;
++        }
++        if (slot.owner_dirty && !slot.prompt.tokens.empty() && !params_base.slot_save_path.empty()) {
++            const int64_t t_start = ggml_time_us();
++            const size_t nwrite = slot_save_file(slot, slot.owner_snapshot, params_base.slot_save_path + slot.owner_snapshot);
++            SLT_INF(slot, "saved unsaved context of %s before eviction: %zu tokens, %.1f MiB, %.1f ms\n",
++                    slot.owner_snapshot.c_str(), (size_t) slot.prompt.tokens.size(), nwrite / (1024.0 * 1024.0),
++                    (ggml_time_us() - t_start) / 1000.0);
++        }
++        slot.owner_snapshot.clear();
++        slot.owner_dirty = false;
++    }
++
+     void slot_save_and_clear(server_slot & slot) {
+         if (slot.prompt.n_tokens() == 0) {
+             return;
+@@ -1174,6 +1256,9 @@ private:
+             // cache prompts only for completion tasks
+             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+ 
++            // the prompt cache below may swap the slot's context out
++            slot_flush_owner(*ret, task.slot_owner);
++
+             if (update_cache) {
+                 SRV_WRN("%s", "updating prompt cache\n");
+ 
+@@ -1991,6 +2076,12 @@ private:
+                         break;
+                     }
+ 
++                    if (!task.is_parent()) {
++                        slot_flush_owner(*slot, task.slot_owner);
++                        slot->owner_snapshot = task.slot_owner;
++                        slot->owner_dirty    = !task.slot_owner.empty();
++                    }
++
+                     if (task.is_parent()) {
+                         // try getting free slots for all child tasks
+                         size_t n_child_tasks = task.child_tasks.size();
+@@ -2100,54 +2191,7 @@ private:
+                     std::string filename = task.slot_action.filename;
+                     std::string filepath = task.slot_action.filepath;
+ 
+-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+-                    if (ctx_dft) {
+-                        llama_state_seq_save_file(ctx_dft.get(), (filepath + ".dft").c_str(), slot->id, tokens.data(), token_count);
+-                    }
+-
+-                    const std::string checkpoint_path = filepath + ".ckpt";
+-                    if (slot->prompt.checkpoints.empty()) {
+-                        std::remove(checkpoint_path.c_str());
+-                    } else if (checkpoints_save_sidecar(slot->prompt.checkpoints, checkpoint_path)) {
+-                        SLT_INF(*slot, "saved %zu context checkpoints to sidecar\n", slot->prompt.checkpoints.size());
+-                    } else {
+-                        SLT_WRN(*slot, "failed to write checkpoint sidecar %s\n", checkpoint_path.c_str());
+-                    }
+-
+-                    if (slot->prompt.tokens.has_media()) {
+-                        json media_meta = json::array();
+-                        for (const auto & it : slot->prompt.tokens.get_media_map()) {
+-                            const size_t idx = it.first;
+-                            const auto & chunk = it.second;
+-                            if (!chunk) continue;
+-                            json entry;
+-                            entry["idx"] = idx;
+-                            entry["type"] = (int)mtmd_input_chunk_get_type(chunk.get());
+-                            const char * cid = mtmd_input_chunk_get_id(chunk.get());
+-                            entry["id"] = cid ? std::string(cid) : "";
+-                            entry["n_tokens"] = mtmd_input_chunk_get_n_tokens(chunk.get());
+-                            entry["n_pos"] = (int64_t)mtmd_input_chunk_get_n_pos(chunk.get());
+-                            const auto * img_tok = mtmd_input_chunk_get_tokens_image(chunk.get());
+-                            if (img_tok) {
+-                                entry["nx"] = (uint32_t)mtmd_image_tokens_get_nx(img_tok);
+-                                entry["ny"] = (uint32_t)mtmd_image_tokens_get_ny(img_tok);
+-                                entry["pos_type"] = mtmd_image_tokens_get_pos_type(img_tok);
+-                                entry["image_idx"] = mtmd_image_tokens_get_image_idx(img_tok);
+-                            }
+-                            media_meta.push_back(entry);
+-                        }
+-                        std::ofstream ofs(filepath + ".media.json");
+-                        if (ofs.is_open()) {
+-                            ofs << media_meta.dump(2);
+-                            ofs.close();
+-                        }
+-                    } else {
+-                        std::remove((filepath + ".media.json").c_str());
+-                    }
+-
+-                    slot->snapshot_filename = filename;
+-                    slot->t_last_used = ggml_time_us();
++                    const size_t nwrite = slot_save_file(*slot, filename, filepath);
+ 
+                     const int64_t t_end = ggml_time_us();
+                     const double t_save_ms = (t_end - t_start) / 1000.0;
+@@ -2177,6 +2221,8 @@ private:
+                         break;
+                     }
+ 
++                    slot_flush_owner(*slot, "");
++
+                     const int64_t t_start = ggml_time_us();
+ 
+                     std::string filename = task.slot_action.filename;
+@@ -2285,6 +2331,8 @@ private:
+                         break;
+                     }
+ 
++                    slot_flush_owner(*slot, "");
++
+                     // Erase token cache
+                     const size_t n_erased = slot->prompt.tokens.size();
+ 
+@@ -2884,18 +2932,21 @@ private:
+ 
+                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+ 
+-                    if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL || p0 == 0) {
+-                        if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
+-                            SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
++                    // Always truncate, including hybrid/recurrent (FULL) contexts: after a checkpoint
++                    // restore only the recurrent part is rewound; the attention KV cells at
++                    // positions >= p0 still hold the previous prompt. Skipping this made new
++                    // tokens coexist with stale cells at the same positions, leaking earlier
++                    // conversations into later ones (regression from c529d79d4).
++                    if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
++                        SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+ 
+-                            slot.prompt_clear(true);
++                        slot.prompt_clear(true);
+ 
+-                            // there is no common part left
+-                            slot.n_prompt_tokens_cache = 0;
+-                        } else {
+-                            if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0, -1)) {
+-                                GGML_ABORT("failed to truncate draft context\n");
+-                            }
++                        // there is no common part left
++                        slot.n_prompt_tokens_cache = 0;
++                    } else {
++                        if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0, -1)) {
++                            GGML_ABORT("failed to truncate draft context\n");
+                         }
+                     }
+ 
+@@ -3672,6 +3723,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+                     meta->logit_bias_eog,
+                     data);
+             task.id_slot = json_value(data, "id_slot", -1);
++            task.slot_owner = json_value(data, "slot_snapshot", std::string());
++            if (!task.slot_owner.empty() && !fs_validate_filename(task.slot_owner)) {
++                task.slot_owner.clear();
++            }
+ 
+             // OAI-compat
+             task.params.res_type          = res_type;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 64bdecd79..7270a7e1c 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -135,6 +135,7 @@ struct server_task {
+     // used by SERVER_TASK_TYPE_CANCEL
+     int id_target = -1;
+     int id_slot   = -1;
++    std::string slot_owner; // snapshot file the request's context belongs to ("slot_snapshot")
+ 
+     // used by parallel sampling (multiple completions from same prompt)
+     int id_parent  = -1;

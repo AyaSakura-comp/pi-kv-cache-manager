@@ -5,6 +5,25 @@
 
 ---
 
+## Current correctness scope
+
+Historical latency tables below measure controlled snapshot/short-reply workloads, not arbitrary concurrent tool loops. Restore and generation remain separate server operations: another Pi process can take the slot between them. Server eviction-before-save helps preserve snapshots but does not make restore+request atomic. This change does not claim to fix that scheduling race.
+
+Snapshot saving is **awaited and serialized**, not detached background disk writing. llama-server synchronizes the context and writes target/draft/checkpoint files on its main task loop; saves can delay inference. Intermediate tool-call turns skip client checkpointing, while the final turn/run saves once per successful session leaf. Eviction-before-save protects dirty state when switching owners.
+
+See [Snapshot dependencies and validation, 2026-10-05](docs/snapshot-release-20261005.md) for pinned core/server/extension commits, CPU gates, the four-session ten-round live test, and its provenance limits.
+
+## Single canonical golden
+
+- Each verified model/adapter runtime has one `golden_<runtime-hash>_base_system_prompt.bin` and matching metadata/tools/sidecars. Session checkpoints remain `kv2_<runtime-and-rendered-prefix-hash>_snap_<id>.bin`; prompt differences never allocate another golden.
+- The first complete serialized request establishes the canonical cwd. Every outgoing request is audited, including RAM/session hits. A different raw system/tools hash, rendered prefix, or loaded-extension fingerprint writes a structured warning to both stderr and `<server-slot-save-path>/golden-warnings.jsonl`. Logs contain hashes and cwd, not prompt/tool contents.
+- Updated Pi core supplies `session_start.extensionsFingerprint` and `extensions_changed`. Loaded extension updates trigger a refresh on the next serialized request **in the canonical cwd**. Other cwd/extension sets warn and preserve golden. Older already-loaded workers cannot roll it back. `/kv base-update` explicitly replaces golden and may select a new canonical cwd.
+- Pi checks loaded extension source contents at the next idle user prompt and reloads changed extensions before that prompt. Streaming/tool loops are not hot-reloaded. New extension discovery still follows Pi resource reload/startup. Runtime logs, virtualenvs and tests do not trigger a source update.
+- Publication uses a per-runtime directory lock, unique staging binary, sidecar backups, rollback on errors and metadata-last publication. Failed warm/save leaves the previous golden usable and retries later. Restore holds the same lock. A process crash can leave a lock/backups requiring operator recovery; no unsafe automatic stale-lock deletion is attempted.
+- A mismatched golden can be loaded as a **candidate**; llama-server verifies token equality and reuses only its common prefix. Restored snapshot token count is not the number of prompt tokens actually reused.
+- Date context is appended by nodriver-browser as a hidden `browser-date-context` message. It is no longer part of the system prefix, and earlier date messages remain unchanged.
+- `/kv status` exposes the canonical filename/cwd, warning log, loaded/golden fingerprints and pending refresh. Core must be rebuilt and workers started with the updated core for automatic change detection; updating the KV extension alone cannot add core events.
+
 ## 🎯 Motivation & Empirical Proof
 
 On large Mixture-of-Experts and dense models (such as Qwen 3.6 35B-A3B), context evaluation exhibits quadratic scaling:
@@ -161,9 +180,9 @@ sequenceDiagram
 
 ---
 
-### 2. Incremental Lazy Checkpointing on `turn_end`
+### 2. Awaited Checkpointing on Final `turn_end` / `agent_end`
 
-To protect long-running sessions without blocking interactive turns, snapshots are written asynchronously:
+Intermediate turns with tool results skip checkpointing. Final turns and `agent_end` await the serialized save when thresholds are met. Successful saves are deduplicated by session/slot/message leaf; failed saves remain retryable. This reduces redundant work but does not make server disk I/O concurrent with inference:
 
 ```mermaid
 sequenceDiagram
@@ -182,7 +201,7 @@ sequenceDiagram
         Ext-->>Agent: Skip checkpoint (turn context too small)
     else Checkpoint Threshold Met
         Ext->>Engine: queueLazySave(sessionId, tokens, slotId=0)
-        Note over Engine: Runs asynchronously; does NOT block user chat
+        Note over Engine: Awaited in the runtime queue; can delay the next request
         Engine->>Llama: POST /slots/0?action=save&filename=session_session_id.bin
         Llama->>Disk: Save binary KV tensors to NVMe
         Llama-->>Engine: { n_saved: 45000, n_written: 960000000, timings: { save_ms: 95.4 } }
@@ -279,15 +298,17 @@ sequenceDiagram
    - Maintains `.meta.json` sidecars tracking `sessionId`, `sessionName`, `tokenCount`, `fileSizeBytes`, and `lastAccessedAt`.
    - Automatically evicts the oldest snapshots when stored sessions exceed `maxSessions` (default: 30) or hard disk quota `maxDiskUsageGb` (default: 40 GB).
 
-3. **Incremental Lazy Checkpointing**:
-   - Saves slot state asynchronously on `turn_end` without stalling conversation.
+3. **Incremental Checkpointing**:
+   - Awaits slot saves on final `turn_end` / `agent_end`; skips intermediate tool-call turns and deduplicates successful saves of the same message leaf.
+   - Save/restore have a 300-second default I/O deadline because large snapshots can queue behind slot work. This is not a background writer.
    - Activates once context exceeds `minTokensThreshold` (default: 3,000 tokens) and advances by at least `stepTokensIncrement` (default: 3,000 tokens).
    - If an unexpected shutdown occurs, the next launch restores the snapshot in ~0.2s and only precomputes the trailing delta!
 
-4. **Golden Base System Prompt & Skills Caching**:
-   - Extracts the compiled system prompt, active skill descriptions, and tool schemas via `ctx.getSystemPrompt()`.
-   - Hashes with SHA-256. If a match is found in `base_system_prompt.bin`, `pi new` boots in **~20ms** instead of 6~9s!
-   - Automatically re-warms and updates the snapshot whenever skills or tools are modified.
+4. **Canonical Golden System Prefix**:
+   - Audits the complete serialized system prompt and tools at `before_provider_request`; early `ctx.getSystemPrompt()` alone is insufficient.
+   - Keeps one `golden_<runtime-hash>_base_system_prompt.bin` per verified model/adapter runtime. Session namespaces use the rendered system-prefix hash.
+   - Loaded-extension changes refresh golden only from its canonical cwd; ordinary prompt/tool differences warn and preserve it. `/kv base-update` explicitly replaces it.
+   - A restored golden is only a candidate until llama-server validates token equality; restore token count is not measured prefix reuse.
 
 5. **Multi-Slot Dynamic Routing & Affinity (`SlotManager`)**:
    - Discovers and manages multiple concurrent server slots (`-np 2`, `-np 4`, etc.).
@@ -312,6 +333,11 @@ sequenceDiagram
    - Lets SWA/GDN models roll back across prompt-tail retokenization instead of discarding the restored snapshot and fully prefilling the conversation.
    - LRU accounting and eviction include `.dft`, `.ckpt`, and `.media.json` sidecars.
 
+10. **Snapshot Ownership & Eviction-before-save (`patches/0005-...`)**:
+   - Requests carry `slot_snapshot` alongside `id_slot`. Updated Pi speculative prefill preserves this owner marker and refuses to pin if it changes.
+   - llama-server saves a dirty owner's context before a different owner replaces it. The patch also always truncates target attention memory after checkpoint rollback.
+   - This protects unsaved context but does not create a slot lease or atomic restore+generation operation.
+
 ---
 
 ## 📦 Installation
@@ -322,8 +348,11 @@ git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0001-allow-
 git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0002-sync-mtp-draft-kv-cache-slots.patch
 git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0003-fix-qwen-preserve-thinking-and-slot-pos-max.patch
 git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0004-persist-context-checkpoints.patch
+git -C /path/to/llama.cpp apply /path/to/pi-kv-cache-manager/patches/0005-save-slot-before-eviction.patch
 cmake --build /path/to/llama.cpp/build --target llama-server -j$(nproc)
 ```
+
+The pinned server fork already contains these fixes; **do not apply the patch bundle again** to it. Patch application is for a compatible unpatched source tree. The automatic loaded-extension refresh and speculative-prefill ownership fixes also require the [pinned Pi core](docs/snapshot-release-20261005.md#pinned-source-baseline), rebuilt with new workers; a stock core or extension-only update is not equivalent.
 
 ### 2. Configure `llama-server`
 Ensure `llama-server` is started with `--slot-save-path`:
@@ -367,19 +396,19 @@ Persistent reuse is now resolved **at `before_provider_request`**, with the seri
 
 On Linux, a single loopback HTTP listener must be provably owned by `llama-server`: bounded `ss -H -ltnpe` (execFile, no shell), `/proc/<pid>/fd` socket inode, executable, process start identity, network/mount namespaces and filesystem root. The explicit `--slot-save-path` (separate or `=` syntax, relative to the server cwd) is authoritative. Client `cacheDir` / `LLAMA_SLOT_SAVE_PATH` hints never override it. `/props` supplies model/runtime identity, **not** the snapshot directory; `/lora-adapters` must supply loaded adapter paths and scales.
 
-Files use a `kv2_<hash>_` filename prefix **in the server's directory**. The hash binds the model's canonical path and local stat identity, adapters/scales/stat identities, executable, launch arguments/environment, advertised defaults/build, auxiliary model/template files, and serialized system/tools/request options. Metadata must carry the same namespace. Existing unbound files are not imported, copied, trusted, or cleaned up. Golden filenames alone never imply a hit. Warmed and restored results are distinct. Server save/restore still uses filenames only, preserving its `.dft` handling.
+Session files use a `kv2_<hash>_` filename prefix **in the server's directory**; canonical golden files use the runtime-only `golden_<hash>_` prefix described above. The hash binds the model's canonical path and local stat identity, adapters/scales/stat identities, executable, launch arguments/environment, advertised defaults/build, auxiliary model/template files, and serialized system/tools/request options. Metadata must carry the same namespace. Existing unbound files are not imported, copied, trusted, or cleaned up. Golden filenames alone never imply a hit. Warmed and restored results are distinct. Server save/restore still uses filenames only, preserving its `.dft` handling.
 
 An existing worker replaces all managers and RAM/session tracking when the identity, directory, settings or process generation changes. Extension operations are serialized; checkpoints are awaited rather than detached. Runtime guards run around slot work, and an overwrite first tombstones its owned metadata so a stale/failed save cannot inherit a previous valid binding. Failed discovery disables extension-managed persistent reuse and `/kv` mutations; normal provider requests continue without an extension slot assignment. Missing binaries and restore failures are not grounds for deleting files.
 
 ### Deliberate limits
 
 - Direct `http://localhost[:port]`, `http://127.0.0.1[:port]` and `http://[::1][:port]` endpoints, optionally `/v1`, are supported without configuration changes (including `http://localhost:8001/v1`). `localhost` DNS has a 2-second deadline; every answer must be exactly IPv4/IPv6 loopback. Empty/non-loopback answers or multiple listeners fail closed. Dual-stack loopback answers are allowed only with one verified listener. Requests retain the selected hostname, port and Host header; a Node HTTP transport pins the validated DNS answers rather than re-resolving between validation and connection. No alternate configured endpoint or redirect is used. Other DNS names, HTTPS, proxies/routers, containers/chroots, inaccessible `/proc`, missing explicit model/save-path flags, split GGUFs, and missing identity APIs fail closed. No remote disk management is promised.
-- HTTP deadlines include headers **and complete response bodies**: discovery 2 seconds, slot/template control calls 5 seconds, and potentially large golden prefills 300 seconds. Internal/embedded callers may override `controlTimeoutMs` / `prefillTimeoutMs` and supply an optional `signal`; these are not new user settings. AbortSignal is passed to the actual transport. A runtime timeout aborts that runtime; cold fallback cannot continue destructive work on it.
+- HTTP deadlines include headers **and complete response bodies**: discovery 2 seconds, lightweight slot/template control calls 5 seconds, and snapshot save/restore plus potentially large golden prefills 300 seconds. Internal/embedded callers may override `controlTimeoutMs` / `prefillTimeoutMs` and supply an optional `signal`; these are not new user settings. AbortSignal is passed to the actual transport. A runtime timeout aborts that runtime; cold fallback cannot continue destructive work on it.
 - Model selection, session start/switch/shutdown, and a changed model/session on a provider request immediately abort active runtime I/O before waiting for the serialized queue. Queued old work is skipped, stale slot assignment/metadata publication/UI callbacks are guarded, and the next provider request can discover a fresh runtime. Cancellation cannot undo an operation already accepted by llama-server or a filesystem syscall already issued; failed saves retain pending metadata, not a valid snapshot. OS DNS lookup itself is not cancellable, but late answers cannot initiate requests or mutate runtime state. CPU fixtures cover cancellation; real server behavior remains a separate parent live-test.
 - Per-request LoRA/adapter overrides fail closed; change server adapters/scales instead. A single string-valued leading system message is required. Later extensions can still rewrite a payload: put this extension after payload-mutating extensions.
 - Stat identity uses device/inode/size/mtime/ctime, **not weight-file hashing**. Files must remain immutable while loaded; restart the server after replacing model/adapter/auxiliary files. This is not a content-addressed or adversarial tamper guarantee.
 - External server/adapter changes cannot be transactionally locked by the current API. Guards detect observed changes and discard stale metadata, but cannot prevent an external change in the final check-to-request gap. Independent Pi processes do not share a slot lease/lock.
-- Quotas apply only to the active namespace. Old namespaces and legacy caches are intentionally retained; this is not a global disk quota across model/prompt histories. `/kv` mutations require a previously verified full provider request; named restores are namespace-bound, not arbitrary filename imports.
+- `maxSessions` applies to the active session namespace; disk accounting spans metadata-bound `kv2_` / `golden_` namespaces and includes binary sidecars. Only owned non-base session snapshots are evictable. Pending/unbound/legacy files are preserved and excluded from accounting; golden snapshots are counted but never evicted, so the configured disk budget is not a hard cap on all directory contents. `/kv` mutations require a previously verified full provider request; named restores are namespace-bound, not arbitrary filename imports.
 
 ### CPU regression tests
 
@@ -421,7 +450,7 @@ Configuration is loaded from `~/.pi/agent/settings.json` (global) or `.pi/settin
 | `minTokensThreshold` | `number` | `3000` | Minimum token count before automatic turn snapshots activate |
 | `stepTokensIncrement` | `number` | `3000` | Token growth required between consecutive automatic snapshots |
 | `enableBaseCache` | `boolean` | `true` | Enables Golden Base System Prompt & Skills prefill caching |
-| `enableIncrementalSave`| `boolean` | `true` | Enables automatic background checkpointing on `turn_end` |
+| `enableIncrementalSave`| `boolean` | `true` | Enables awaited checkpoints on final `turn_end` / `agent_end` |
 
 ---
 
@@ -442,7 +471,7 @@ Configuration is loaded from `~/.pi/agent/settings.json` (global) or `.pi/settin
 
 The extension dynamically updates the status line in Pi's UI footer:
 - `[KV: 110k ⚡]`: Instant restore completed for 110,000 tokens.
-- `[KV: 115k 💾]`: Background incremental snapshot written to NVMe SSD.
+- `[KV: 115k 💾]`: Awaited incremental snapshot written to NVMe SSD.
 - `[KV: Base 28k ⚡]`: Golden Base cache hit; instant cold start achieved.
 - `[KV: Base 28k 💾]`: Golden Base pre-warmed and saved to disk.
 
@@ -460,7 +489,8 @@ pi-kv-cache-manager/
 │   ├── 0001-allow-text-slot-save-restore-with-mmproj.patch # Upstream PR patch for llama.cpp
 │   ├── 0002-sync-mtp-draft-kv-cache-slots.patch           # Dual-track MTP draft KV sync & checkpoint fix
 │   ├── 0003-fix-qwen-preserve-thinking-and-slot-pos-max.patch # Qwen template & slot checkpoint alignment
-│   └── 0004-persist-context-checkpoints.patch             # Hybrid/SWA checkpoint sidecar persistence
+│   ├── 0004-persist-context-checkpoints.patch             # Hybrid/SWA checkpoint sidecar persistence
+│   └── 0005-save-slot-before-eviction.patch               # Dirty owner save + target-memory truncation
 └── src/
     ├── index.ts                # Pi Agent Extension Entry Point, Hooks & Command Wiring
     ├── config.ts               # Configuration Loader & Defaults (30 sessions / 40GB)
