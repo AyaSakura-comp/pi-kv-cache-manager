@@ -5,6 +5,12 @@ import type { RequestOptions } from "./request.js";
 export interface KvManagerConfig extends RequestOptions {
     /** Internal server + full request-prefix namespace; never loaded from user settings. */
     snapshotPrefix?: string;
+    /** Canonical golden namespace (model/adapter identity only, independent of session prefix). */
+    goldenPrefix?: string;
+    goldenCwd?: string;
+    renderedPrefixHash?: string;
+    extensionsFingerprint?: string;
+    extensionLoadedAt?: number;
     runtimeIdentity?: string;
     templateOptions?: Record<string, unknown>;
     assertCurrent?: () => Promise<void>;
@@ -29,6 +35,10 @@ export interface KvManagerConfig extends RequestOptions {
 }
 export interface SnapshotMetadata {
     namespace?: string;
+    canonicalCwd?: string;
+    renderedPrefixHash?: string;
+    extensionsFingerprint?: string;
+    extensionLoadedAt?: number;
     sessionId: string;
     sessionName?: string;
     tokenCount: number;

@@ -84,13 +84,17 @@ export class SlotManager {
         // Selection priority:
         // Priority A: An empty / fresh slot not actively assigned to another session
         let chosenSlot = candidates.find((s) => !s.snapshot_filename && !this.activeSlotSessions.has(s.id));
-        // Priority B: Any slot not actively assigned to another session
+        // Priority B: The least recently used slot not actively assigned to another session.
+        // Each piweb session is its own pi process, so other sessions' bindings are invisible
+        // here: taking the first such slot evicted a session paused on a long tool call while
+        // the other slot had sat idle for hours.
+        const byLastUsed = (a, b) => (a.t_last_used ?? 0) - (b.t_last_used ?? 0);
         if (!chosenSlot) {
-            chosenSlot = candidates.find((s) => !this.activeSlotSessions.has(s.id));
+            chosenSlot = candidates.filter((s) => !this.activeSlotSessions.has(s.id)).sort(byLastUsed)[0];
         }
         // Priority C: The least recently used slot (smallest t_last_used)
         if (!chosenSlot) {
-            chosenSlot = [...candidates].sort((a, b) => (a.t_last_used ?? 0) - (b.t_last_used ?? 0))[0];
+            chosenSlot = [...candidates].sort(byLastUsed)[0];
         }
         const targetSlotId = chosenSlot ? chosenSlot.id : this.config.slotId;
         this.activeSlotSessions.delete(targetSlotId);
@@ -144,7 +148,7 @@ export class SlotManager {
         // ONLY check/warm if tools are provided (ensures full system prompt + tool schemas are present)
         if (this.config.enableBaseCache && systemPrompt && systemPrompt.length > 0 && tools !== undefined) {
             const baseRes = await this.baseCache.checkAndRestore(systemPrompt, targetSlotId, tools);
-            if (baseRes.status === "hit") {
+            if (baseRes.status === "hit" || baseRes.status === "partial") {
                 checkCancelled(this.config);
                 this.activeSlotSessions.set(targetSlotId, sessionId);
                 return {
@@ -152,11 +156,12 @@ export class SlotManager {
                     hit: false,
                     restored: true,
                     isBase: true,
+                    exactBase: baseRes.status === "hit",
                     tokens: baseRes.tokens,
                     durationMs: baseRes.durationMs,
                 };
             }
-            else if (baseRes.status === "miss" || baseRes.status === "error") {
+            else if (!this.config.goldenPrefix && (baseRes.status === "miss" || baseRes.status === "error")) {
                 // Auto-warm and snapshot Golden Base on miss or error (system prompt or tools changed or first run)
                 try {
                     const warmRes = await this.baseCache.warmAndSave(systemPrompt, baseRes.hash, targetSlotId, tools);

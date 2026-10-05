@@ -7,5 +7,6 @@ export interface RuntimeDependencies {
     }) => Promise<ResolvedRuntime>;
     loadConfig?: typeof loadConfig;
 }
+export declare function prefixOptions(options: Record<string, unknown>): Record<string, unknown>;
 export default function piKvCacheManager(pi: ExtensionAPI, dependencies?: RuntimeDependencies): void;
 //# sourceMappingURL=index.d.ts.map

@@ -8,6 +8,7 @@ export interface SlotResolutionResult {
     restored: boolean;
     warmed?: boolean;
     isBase?: boolean;
+    exactBase?: boolean;
     tokens?: number;
     durationMs?: number;
 }

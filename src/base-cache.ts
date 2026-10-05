@@ -2,6 +2,7 @@ import { boundedFetch, checkCancelled } from "./request.js";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import type { KvManagerConfig, SnapshotMetadata } from "./types.js";
 import { saveSlot, restoreSlot, eraseSlot, fetchSlots } from "./checkpoint-engine.js";
 import { LruManager } from "./lru-manager.js";
@@ -30,7 +31,7 @@ export function computeHash(content: string, tools?: unknown[]): string {
 }
 
 export interface BaseCacheRestoreResult {
-  status: "hit" | "miss" | "disabled" | "error";
+  status: "hit" | "partial" | "miss" | "disabled" | "error";
   hash: string;
   tokens?: number;
   durationMs?: number;
@@ -42,8 +43,8 @@ export class BaseCacheManager {
   private lru: LruManager;
 
   constructor(config: KvManagerConfig, lru: LruManager) {
-    this.config = config;
-    this.lru = lru;
+    this.config = config.goldenPrefix ? { ...config, snapshotPrefix: config.goldenPrefix } : config;
+    this.lru = config.goldenPrefix ? new LruManager(config.cacheDir, config.goldenPrefix, config.signal) : lru;
   }
 
   getFilename(): string {
@@ -88,15 +89,106 @@ export class BaseCacheManager {
     return this.lru.readMetadata(this.getMetaPath());
   }
 
+  private async withGoldenLock<T>(operation: () => Promise<T>): Promise<T> {
+    const lock = path.join(this.config.cacheDir, `${this.config.goldenPrefix}update.lock`);
+    const deadline = Date.now() + 60_000;
+    for (;;) {
+      checkCancelled(this.config);
+      try { await fs.mkdir(lock); break; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (Date.now() > deadline) throw new Error(`Golden update lock busy: ${lock}; no cache files changed`);
+        await delay(25, undefined, { signal: this.config.signal });
+      }
+    }
+    try { return await operation(); }
+    finally { await fs.rmdir(lock); }
+  }
+
+  /** Audit every request; only a loaded-extension change or explicit update replaces golden. */
+  async ensureGolden(systemPrompt: string, tools: unknown[], force = false): Promise<void> {
+    if ((!this.config.enableBaseCache && !force) || !this.config.goldenPrefix) return;
+    await this.withGoldenLock(async () => {
+      await this.config.assertCurrent?.();
+      const meta = await this.getBaseMetadata();
+      const hash = computeHash(systemPrompt, tools);
+      const mismatch = !!meta && (meta.promptPrefixHash !== hash || meta.renderedPrefixHash !== this.config.renderedPrefixHash);
+      const changed = !!meta && !!this.config.extensionsFingerprint && meta.extensionsFingerprint !== this.config.extensionsFingerprint;
+      const canUpdate = changed && meta?.canonicalCwd === this.config.goldenCwd &&
+        (this.config.extensionLoadedAt ?? 0) > (meta?.extensionLoadedAt ?? 0);
+      if (mismatch || changed) {
+        const warning = { type: "golden_mismatch", timestamp: new Date().toISOString(),
+          golden: this.getFilename(), expectedHash: meta?.promptPrefixHash, actualHash: hash,
+          expectedRenderedHash: meta?.renderedPrefixHash, actualRenderedHash: this.config.renderedPrefixHash,
+          expectedExtensions: meta?.extensionsFingerprint, actualExtensions: this.config.extensionsFingerprint,
+          canonicalCwd: meta?.canonicalCwd, cwd: this.config.goldenCwd,
+          action: force || canUpdate ? "update" : "preserve" };
+        console.warn(`[pi-kv-cache-manager] ${JSON.stringify(warning)}`);
+        await fs.appendFile(path.join(this.config.cacheDir, "golden-warnings.jsonl"), `${JSON.stringify(warning)}\n`);
+      }
+      let present = false;
+      try { await fs.access(this.getBinPath()); present = true; } catch (error) { checkCancelled(this.config, error); }
+      if (meta && present && !force && !canUpdate) return;
+      // A unique staging snapshot keeps the previous golden usable if warm/save fails.
+      const prefix = `${this.config.goldenPrefix}build_${crypto.randomUUID()}_`;
+      const stageConfig = { ...this.config, goldenPrefix: undefined, snapshotPrefix: prefix };
+      const stage = new BaseCacheManager(stageConfig, new LruManager(this.config.cacheDir, prefix, this.config.signal));
+      const suffixes = ["", ".dft", ".ckpt", ".media.json"];
+      const backups: Array<{ target: string; backup: string }> = [];
+      const installed: string[] = [];
+      let committed = false;
+      try {
+        await stage.warmAndSave(systemPrompt, hash, undefined, tools);
+        const saved = await stage.getBaseMetadata();
+        if (!saved || saved.tokenCount <= 0) throw new Error("Golden staging metadata unavailable");
+        await this.config.assertCurrent?.();
+        for (const suffix of [...suffixes, ".meta.json", ".tools.json"]) {
+          const target = suffix === ".meta.json" ? this.getMetaPath() : suffix === ".tools.json" ? this.getToolsPath() : this.getBinPath() + suffix;
+          const source = suffix === ".meta.json" ? stage.getMetaPath() : suffix === ".tools.json" ? stage.getToolsPath() : stage.getBinPath() + suffix;
+          const backup = `${target}.${crypto.randomUUID()}.backup`;
+          try { await fs.rename(target, backup); backups.push({ target, backup }); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+          if (suffix === ".meta.json") continue;
+          try { await fs.rename(source, target); installed.push(target); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" || suffix === "") throw error; }
+        }
+        const published = { ...saved, namespace: this.config.goldenPrefix, canonicalCwd: this.config.goldenCwd,
+          renderedPrefixHash: this.config.renderedPrefixHash, extensionsFingerprint: this.config.extensionsFingerprint,
+          extensionLoadedAt: this.config.extensionLoadedAt };
+        await fs.writeFile(stage.getMetaPath(), JSON.stringify(published, null, 2), { signal: this.config.signal });
+        checkCancelled(this.config);
+        await fs.rename(stage.getMetaPath(), this.getMetaPath());
+        committed = true;
+      } finally {
+        if (!committed) {
+          for (const target of installed) await fs.unlink(target).catch(() => {});
+          for (const { target, backup } of backups.reverse()) await fs.rename(backup, target);
+        } else {
+          for (const { backup } of backups) await fs.unlink(backup).catch(() => {});
+        }
+        for (const file of [stage.getBinPath(), ...suffixes.slice(1).map(s => stage.getBinPath() + s), stage.getMetaPath(), stage.getToolsPath()]) {
+          await fs.unlink(file).catch(() => {});
+        }
+      }
+    });
+  }
+
   /**
-   * Checks whether the current system prompt + tools match the cached golden base snapshot.
-   * If matched, restores it instantly into the slot (~20ms).
+   * Restore a validated runtime snapshot. Canonical golden may be a partial
+   * candidate; only llama-server can measure the actually reusable token prefix.
    */
   async checkAndRestore(
     systemPrompt: string,
     slotId: number = this.config.slotId,
     tools?: unknown[]
   ): Promise<BaseCacheRestoreResult> {
+    if (this.config.goldenPrefix && this.config.enableBaseCache) {
+      return this.withGoldenLock(() => this.restoreBase(systemPrompt, slotId, tools));
+    }
+    return this.restoreBase(systemPrompt, slotId, tools);
+  }
+
+  private async restoreBase(systemPrompt: string, slotId: number, tools?: unknown[]): Promise<BaseCacheRestoreResult> {
     if (!this.config.enableBaseCache) {
       return { status: "disabled", hash: "" };
     }
@@ -109,9 +201,10 @@ export class BaseCacheManager {
     const currentHash = computeHash(systemPrompt, effectiveTools);
     const meta = await this.getBaseMetadata();
 
-    if (!meta || meta.promptPrefixHash !== currentHash) {
+    if (!meta || (!this.config.goldenPrefix && meta.promptPrefixHash !== currentHash)) {
       return { status: "miss", hash: currentHash };
     }
+    const exact = meta.promptPrefixHash === currentHash && (!this.config.goldenPrefix || meta.renderedPrefixHash === this.config.renderedPrefixHash);
 
     // Verify bin file exists
     try {
@@ -135,7 +228,8 @@ export class BaseCacheManager {
       await this.lru.touchSnapshot(this.getFilename());
 
       return {
-        status: "hit",
+        // llama-server verifies token equality and resumes only the common prefix.
+        status: exact ? "hit" : "partial",
         hash: currentHash,
         tokens: resp.n_restored ?? resp.n_tokens ?? meta.tokenCount,
         durationMs: resp.timings?.restore_ms ?? resp.t_ms ?? 0,
@@ -144,7 +238,7 @@ export class BaseCacheManager {
       checkCancelled(this.config, err);
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(
-        `[pi-kv-cache-manager] Failed to restore base snapshot (${msg}); preserving files and trying a fresh warm...`
+        `[pi-kv-cache-manager] Failed to restore base snapshot (${msg}); preserving files for a later retry...`
       );
       // An HTTP/discovery failure is not evidence that the snapshot is corrupt.
       // Leave binaries and MTP sidecars untouched; a later successful warm may replace them.

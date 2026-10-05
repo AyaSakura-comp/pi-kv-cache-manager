@@ -17,8 +17,8 @@ export declare class CheckpointEngine {
     isSaving(sessionId: string): boolean;
     getSnapshotFilename(sessionId: string): string;
     /**
-     * Evaluates token progress after a turn and executes an asynchronous,
-     * non-blocking snapshot save if threshold conditions are met.
+     * Evaluates token progress after a turn and awaits a serialized snapshot
+     * save if threshold conditions are met. Server disk I/O is synchronous.
      */
     maybeCheckpoint(sessionId: string, sessionName: string | undefined, currentTokens: number, slotId?: number, onSuccess?: (info: {
         tokens: number;

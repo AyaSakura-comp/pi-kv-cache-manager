@@ -13,13 +13,14 @@ export declare class LruManager {
     constructor(cacheDir: string, namespace?: string, signal?: AbortSignal | undefined);
     invalidateSnapshot(filename: string): Promise<void>;
     getEvictionsCount(): number;
-    readMetadata(metaPath: string): Promise<SnapshotMetadata | null>;
+    readMetadata(metaPath: string, matchNamespace?: boolean): Promise<SnapshotMetadata | null>;
     writeMetadata(metaPath: string, meta: SnapshotMetadata): Promise<void>;
     touchSnapshot(filename: string): Promise<void>;
-    listSnapshots(): Promise<SnapshotItem[]>;
+    listSnapshots(allNamespaces?: boolean): Promise<SnapshotItem[]>;
     /**
      * Enforces LRU eviction based on maxSessions and maxDiskUsageGb.
      * Golden base cache (base_system_prompt.bin) is always preserved.
+     * Global disk usage is checked across all namespaces in cacheDir.
      */
     enforceLRU(config: KvManagerConfig): Promise<{
         prunedFiles: string[];

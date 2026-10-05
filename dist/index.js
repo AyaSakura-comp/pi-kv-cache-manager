@@ -1,10 +1,11 @@
 import * as path from "node:path";
 import { DEFAULT_CONFIG, loadConfig } from "./config.js";
-import { resolveRuntime, RuntimeQueue } from "./runtime.js";
+import { cachedRuntimeResolver, RuntimeQueue } from "./runtime.js";
 import { LruManager } from "./lru-manager.js";
 import { CheckpointEngine, saveSlot, restoreSlot, fetchSlots } from "./checkpoint-engine.js";
 import { BaseCacheManager, computeHash, stableStringify } from "./base-cache.js";
 import { SlotManager } from "./slot-manager.js";
+import { boundedFetch, checkCancelled } from "./request.js";
 const STATUS_KEY = "kv-cache";
 function formatTokens(n) {
     if (n >= 1000000)
@@ -77,8 +78,52 @@ function isLlamaServerContext(ctx, config) {
     }
     return false;
 }
+// Request fields llama-server applies only after the chat template is rendered
+// (sampling / length limits / response shaping). They never change the prompt
+// tokens a snapshot holds, so they must not split the snapshot namespace:
+// otherwise every thinking level re-warms its own copy of the same system prefix.
+// Unknown fields still count, so anything that could reach the template stays safe.
+const NON_PREFIX_OPTIONS = new Set([
+    "max_tokens", "max_completion_tokens", "n_predict", "thinking_budget_tokens", "reasoning_budget_tokens",
+    "temperature", "top_p", "top_k", "min_p", "typical_p", "seed", "presence_penalty", "frequency_penalty",
+    "repeat_penalty", "repeat_last_n", "logit_bias", "logprobs", "top_logprobs", "n_probs", "stop",
+    "store", "user", "metadata", "cache_prompt", "timings_per_token", "return_progress",
+]);
+export function prefixOptions(options) {
+    return Object.fromEntries(Object.entries(options).filter(([key]) => !NON_PREFIX_OPTIONS.has(key)));
+}
+const renderedPrefixes = new Map();
+/** Hash of the system prefix as llama-server's chat template renders it, or undefined. */
+async function renderedPrefixKey(serverUrl, transport, prompt, tools, options, runtimeKey, signal) {
+    const key = computeHash(stableStringify({ serverUrl, runtimeKey, prompt, tools, options }));
+    const cached = renderedPrefixes.get(key);
+    if (cached)
+        return cached;
+    try {
+        const response = await boundedFetch(`${serverUrl.replace(/\/$/, "")}/apply-template`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ messages: [{ role: "system", content: prompt }], ...options,
+                ...(tools.length ? { tools } : {}), add_generation_prompt: false }),
+        }, { signal, transport });
+        if (!response.ok)
+            return undefined;
+        const data = await response.json();
+        if (typeof data.prompt !== "string" || !data.prompt)
+            return undefined;
+        const rendered = computeHash(`rendered:${data.prompt}`);
+        if (renderedPrefixes.size >= 64)
+            renderedPrefixes.delete(renderedPrefixes.keys().next().value);
+        renderedPrefixes.set(key, rendered);
+        return rendered;
+    }
+    catch (error) {
+        signal.throwIfAborted();
+        return undefined;
+    }
+}
 export default function piKvCacheManager(pi, dependencies = {}) {
-    const discover = dependencies.resolve ?? resolveRuntime;
+    const discover = dependencies.resolve ?? cachedRuntimeResolver();
     const readConfig = dependencies.loadConfig ?? loadConfig;
     let config = DEFAULT_CONFIG;
     let lru;
@@ -89,6 +134,9 @@ export default function piKvCacheManager(pi, dependencies = {}) {
     let ready = false;
     let selectedModel = "";
     let lastPrefix;
+    let lastCheckpointLeafKey;
+    let extensionsFingerprint;
+    let extensionLoadedAt = Date.now();
     const queue = new RuntimeQueue();
     let lifetime = new AbortController();
     let activeContext = "";
@@ -129,7 +177,7 @@ export default function piKvCacheManager(pi, dependencies = {}) {
     });
     const sessionSlots = new Map();
     const modelKey = (ctx) => stableStringify(ctx.model);
-    const invalidate = () => { ready = false; runtimeKey = ""; sessionSlots.clear(); lastPrefix = undefined; };
+    const invalidate = () => { ready = false; runtimeKey = ""; sessionSlots.clear(); lastPrefix = undefined; lastCheckpointLeafKey = undefined; };
     const refresh = async (ctx, payload) => {
         const controller = lifetime;
         const signal = controller.signal;
@@ -155,7 +203,12 @@ export default function piKvCacheManager(pi, dependencies = {}) {
             if (!Array.isArray(tools))
                 throw new Error("Unsupported tool payload");
             const { messages: _messages, tools: _tools, id_slot: _slot, stream: _stream, stream_options: _streamOptions, ...options } = payload;
-            const prefix = computeHash(stableStringify({ prompt: messages[0].content, tools, options }));
+            // A snapshot holds the RENDERED system prefix, so it is keyed by the rendered
+            // text: request options that do not change it (thinking on/off, budgets,
+            // sampling) keep the same namespace and the session's live slot. Falls back to
+            // hashing the options when the server cannot render.
+            const prefix = await renderedPrefixKey(resolved.serverUrl, resolved.transport, messages[0].content, tools, options, `${resolved.identity}:${resolved.generation}`, signal)
+                ?? computeHash(stableStringify({ prompt: messages[0].content, tools, options: prefixOptions(options) }));
             const snapshotPrefix = `kv2_${computeHash(resolved.identity + prefix)}_`;
             const key = stableStringify({ resolved, settings, snapshotPrefix });
             if (!ready || key !== runtimeKey) {
@@ -168,6 +221,8 @@ export default function piKvCacheManager(pi, dependencies = {}) {
                         throw new Error("KV runtime changed; skip stale work");
                 };
                 config = { ...settings, llamaServerUrl: resolved.serverUrl, cacheDir: resolved.cacheDir,
+                    goldenPrefix: `golden_${computeHash(resolved.identity)}_`, goldenCwd: ctx.cwd,
+                    renderedPrefixHash: prefix, extensionsFingerprint, extensionLoadedAt,
                     runtimeIdentity: resolved.identity, snapshotPrefix, templateOptions: options, assertCurrent,
                     signal, abortRuntime: reason => controller.abort(reason), transport: resolved.transport };
                 lru = new LruManager(config.cacheDir, snapshotPrefix, signal);
@@ -214,11 +269,13 @@ export default function piKvCacheManager(pi, dependencies = {}) {
         config.signal?.throwIfAborted();
         sessionSlots.set(sessionId, res.slotId);
         if (res.restored) {
-            const label = res.isBase ? `Base ${formatTokens(res.tokens ?? 0)}` : formatTokens(res.tokens ?? 0);
+            const partial = res.isBase && res.exactBase === false;
+            const label = partial ? "Golden candidate" : res.isBase ? `Base ${formatTokens(res.tokens ?? 0)}` : formatTokens(res.tokens ?? 0);
             try {
                 if (ctx.hasUI) {
                     ctx.ui.setStatus(STATUS_KEY, `KV: ${label} (S${res.slotId}) ⚡`);
-                    ctx.ui.notify(`Restored KV cache to slot ${res.slotId}: ${(res.tokens ?? 0).toLocaleString()} tokens in ${(res.durationMs || 0).toFixed(1)}ms (⚡ instant resume)`, "info");
+                    ctx.ui.notify(partial ? `Golden candidate loaded into slot ${res.slotId}; llama-server will validate the common token prefix. Snapshot token count is not a cache-hit measurement.` :
+                        `Restored KV cache to slot ${res.slotId}: ${(res.tokens ?? 0).toLocaleString()} tokens in ${(res.durationMs || 0).toFixed(1)}ms`, "info");
                 }
             }
             catch {
@@ -267,6 +324,13 @@ export default function piKvCacheManager(pi, dependencies = {}) {
         }
         let slotId;
         try {
+            try {
+                await baseCache.ensureGolden(systemPrompt, tools ?? []);
+            }
+            catch (error) {
+                checkCancelled(config, error);
+                console.warn(`[pi-kv-cache-manager] Golden update deferred (previous golden preserved): ${String(error)}`);
+            }
             slotId = await activateSessionSlot(ctx, systemPrompt, tools ?? []);
             await config.assertCurrent?.();
         }
@@ -277,6 +341,12 @@ export default function piKvCacheManager(pi, dependencies = {}) {
         }
         if (event.payload && typeof event.payload === "object") {
             event.payload.id_slot = slotId;
+            // Names the snapshot this context belongs to: before llama-server lets another
+            // context replace the slot, it saves any state this file does not have yet (e.g.
+            // turns that ended in tool calls, which skip the save below).
+            const sessionId = ctx.sessionManager?.getSessionId();
+            if (sessionId)
+                event.payload.slot_snapshot = engine.getSnapshotFilename(sessionId);
             // Ensure preserve_thinking is set so subsequent turns retain assistant thinking blocks in KV cache!
             const currentKwargs = event.payload.chat_template_kwargs || {};
             event.payload.chat_template_kwargs = {
@@ -286,18 +356,25 @@ export default function piKvCacheManager(pi, dependencies = {}) {
         }
     });
     // Hook 1: Session Start (Cold boot or resume)
-    on("session_start", async (_event, ctx) => {
+    on("session_start", async (event, ctx) => {
+        extensionsFingerprint = event.extensionsFingerprint;
+        extensionLoadedAt = Math.max(Date.now(), extensionLoadedAt + 1);
         invalidate();
         try {
             ctx.ui.setStatus(STATUS_KEY, undefined);
         }
         catch { }
     });
+    on("extensions_changed", async (event) => {
+        extensionsFingerprint = event.current;
+        // Rebuild only after serialization supplies all before_agent_start changes and tools.
+        invalidate();
+    });
     on("session_switch", async () => { invalidate(); });
     // Hook 1.5: Before Agent Start (Persistent RPC & subsequent turns slot verification)
     // Activation deliberately waits for before_provider_request: earlier hooks lack serialized tools.
     // Hook 2: Turn End (Incremental lazy checkpointing)
-    on("turn_end", async (_event, ctx) => {
+    const checkpoint = async (ctx) => {
         if (!await verifyActive(ctx)) {
             return;
         }
@@ -308,10 +385,19 @@ export default function piKvCacheManager(pi, dependencies = {}) {
             const slotId = sessionSlots.get(sessionId);
             if (slotId === undefined)
                 return;
+            // Final turn_end and agent_end see the same persisted message leaf. With
+            // stepTokensIncrement=0 they otherwise write the same large snapshot twice.
+            // Token estimates alone are not a content identity; changed leaves still save.
+            const leafId = ctx.sessionManager?.getLeafId?.();
+            const leafKey = leafId ? stableStringify([sessionId, slotId, leafId]) : undefined;
+            if (leafKey && leafKey === lastCheckpointLeafKey)
+                return;
             const usage = ctx.getContextUsage?.();
             const currentTokens = usage?.tokens || 0;
             const sessionName = ctx.sessionManager?.getSessionName?.();
             await engine.maybeCheckpoint(sessionId, sessionName, currentTokens, slotId, (info) => {
+                // Mark only successful saves, so agent_end can retry a failed turn_end.
+                lastCheckpointLeafKey = leafKey;
                 try {
                     if (ctx.hasUI) {
                         ctx.ui.setStatus(STATUS_KEY, `KV: ${formatTokens(info.tokens)} (S${slotId}) 💾`);
@@ -329,7 +415,16 @@ export default function piKvCacheManager(pi, dependencies = {}) {
         catch (err) {
             console.warn(`[pi-kv-cache-manager] Error in turn_end handler:`, err);
         }
+    };
+    // A turn that ended in tool calls is followed at once by the next request, so
+    // saving there sat on the critical path (and queued behind any prefill of the
+    // tool result on the same slot). Those turns save when the run ends instead.
+    on("turn_end", async (event, ctx) => {
+        if (Array.isArray(event?.toolResults) && event.toolResults.length > 0)
+            return;
+        await checkpoint(ctx);
     });
+    on("agent_end", async (_event, ctx) => { await checkpoint(ctx); });
     // Hook 2.5: Model Select (Hide/show KV indicator dynamically when switching models)
     on("model_select", async (_event, ctx) => {
         invalidate();
@@ -377,8 +472,10 @@ export default function piKvCacheManager(pi, dependencies = {}) {
                 switch (sub) {
                     case "status": {
                         const snapshots = await lru.listSnapshots();
-                        const totalBytes = snapshots.reduce((acc, s) => acc + s.meta.fileSizeBytes, 0);
-                        const baseSnap = snapshots.find((s) => s.meta.isBaseSnapshot);
+                        const allSnapshots = await lru.listSnapshots(true);
+                        const totalGlobalBytes = allSnapshots.reduce((acc, s) => acc + s.meta.fileSizeBytes, 0);
+                        const baseMeta = await baseCache.getBaseMetadata();
+                        const baseSnap = allSnapshots.find((s) => s.binFilename === baseCache.getFilename());
                         const sessionSnaps = snapshots.filter((s) => !s.meta.isBaseSnapshot);
                         const usage = ctx.getContextUsage?.();
                         const activeTokens = usage?.tokens ?? 0;
@@ -390,12 +487,17 @@ export default function piKvCacheManager(pi, dependencies = {}) {
                             "",
                             `- **Llama Server**: \`${config.llamaServerUrl}\` (Active Slot: \`${currentSlot}\`)`,
                             `- **Cache Storage Root**: \`${config.cacheDir}\``,
-                            `- **Disk Usage**: **${LruManager.formatBytes(totalBytes)}** / ${config.maxDiskUsageGb} GB (${snapshots.length} total snapshots)`,
-                            `- **Session Snapshots**: ${sessionSnaps.length} / ${config.maxSessions} max`,
+                            `- **Disk Usage**: **${LruManager.formatBytes(totalGlobalBytes)}** / ${config.maxDiskUsageGb} GB (${allSnapshots.length} total snapshots in cache directory)`,
+                            `- **Active Namespace Snapshots**: ${sessionSnaps.length} / ${config.maxSessions} max sessions (${snapshots.length} total)`,
                             `- **LRU Evictions Performed**: ${lru.getEvictionsCount()}`,
                             `- **Active Session Tokens**: ${activeTokens.toLocaleString()} (Saved: ${lastSavedTokens.toLocaleString()}, Delta: ${(activeTokens - lastSavedTokens).toLocaleString()})`,
                             `- **Incremental Auto-save**: ${config.enableIncrementalSave ? `Enabled (every ${config.stepTokensIncrement.toLocaleString()} tok, min ${config.minTokensThreshold.toLocaleString()})` : "Disabled"}`,
                             `- **Golden Base Cache**: ${baseSnap ? `✅ ${baseSnap.meta.tokenCount.toLocaleString()} tokens (${LruManager.formatBytes(baseSnap.meta.fileSizeBytes)})` : "❌ None"}`,
+                            `- **Canonical Golden**: \`${baseCache.getFilename()}\` (cwd: \`${baseMeta?.canonicalCwd ?? "unset"}\`)`,
+                            `- **Golden Warnings**: \`${path.join(config.cacheDir, "golden-warnings.jsonl")}\``,
+                            `- **Loaded Extensions**: \`${extensionsFingerprint ?? "unavailable; reload updated pi core"}\``,
+                            `- **Golden Extensions**: \`${baseMeta?.extensionsFingerprint ?? "unset"}\``,
+                            `- **Pending Golden Update**: ${extensionsFingerprint && baseMeta?.extensionsFingerprint !== extensionsFingerprint ? "yes (next serialized request in canonical cwd)" : "no"}`,
                             "",
                         ];
                         try {
@@ -536,15 +638,11 @@ export default function piKvCacheManager(pi, dependencies = {}) {
                         if (!lastPrefix)
                             return;
                         const { prompt, tools } = lastPrefix;
-                        const hash = computeHash(prompt, tools);
                         try {
                             notifyUser(ctx, "Prefilling system prompt and tools into an available slot...", "info");
-                            const info = await baseCache.warmAndSave(prompt, hash, undefined, tools);
-                            try {
-                                ctx.ui.setStatus(STATUS_KEY, `KV: Base ${formatTokens(info.tokens)} (S${info.slotId}) 💾`);
-                            }
-                            catch { }
-                            notifyUser(ctx, `✅ Golden Base cache refreshed: ${info.tokens.toLocaleString()} tokens (${LruManager.formatBytes(info.bytes)}) saved into Slot ${info.slotId} in ${info.durationMs.toFixed(1)}ms`, "info");
+                            await baseCache.ensureGolden(prompt, tools, true);
+                            const meta = await baseCache.getBaseMetadata();
+                            notifyUser(ctx, `Golden Base refreshed: ${meta?.tokenCount.toLocaleString() ?? "unknown"} tokens in ${baseCache.getFilename()}`, "info");
                         }
                         catch (err) {
                             const msg = err instanceof Error ? err.message : String(err);

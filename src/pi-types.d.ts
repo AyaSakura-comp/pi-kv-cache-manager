@@ -6,6 +6,7 @@ declare module "@earendil-works/pi-coding-agent" {
 
   export interface ReadonlySessionManager {
     getSessionId(): string;
+    getLeafId?(): string | null;
     getSessionName(): string | undefined;
     getCwd(): string;
     getSessionDir(): string;
@@ -42,7 +43,22 @@ declare module "@earendil-works/pi-coding-agent" {
     handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
   }
 
+  export interface SessionStartEvent {
+    type: "session_start";
+    reason: "startup" | "reload" | "new" | "resume" | "fork";
+    extensionsFingerprint?: string;
+  }
+
+  export interface ExtensionsChangedEvent {
+    type: "extensions_changed";
+    previous?: string;
+    current: string;
+    changed: string[];
+  }
+
   export interface ExtensionAPI {
+    on(event: "session_start", handler: (event: SessionStartEvent, ctx: ExtensionContext) => Promise<unknown> | unknown): void;
+    on(event: "extensions_changed", handler: (event: ExtensionsChangedEvent, ctx: ExtensionContext) => Promise<unknown> | unknown): void;
     on(event: string, handler: (event: any, ctx: ExtensionContext) => Promise<unknown> | unknown): void;
     registerCommand(name: string, options: RegisteredCommand): void;
     registerTool(tool: unknown): void;

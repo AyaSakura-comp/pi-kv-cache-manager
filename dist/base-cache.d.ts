@@ -6,7 +6,7 @@ export declare const BASE_TOOLS_JSON = "base_tools.json";
 export declare function stableStringify(obj: unknown): string;
 export declare function computeHash(content: string, tools?: unknown[]): string;
 export interface BaseCacheRestoreResult {
-    status: "hit" | "miss" | "disabled" | "error";
+    status: "hit" | "partial" | "miss" | "disabled" | "error";
     hash: string;
     tokens?: number;
     durationMs?: number;
@@ -23,11 +23,15 @@ export declare class BaseCacheManager {
     loadCachedTools(): Promise<unknown[] | undefined>;
     saveCachedTools(tools: unknown[]): Promise<void>;
     getBaseMetadata(): Promise<SnapshotMetadata | null>;
+    private withGoldenLock;
+    /** Audit every request; only a loaded-extension change or explicit update replaces golden. */
+    ensureGolden(systemPrompt: string, tools: unknown[], force?: boolean): Promise<void>;
     /**
-     * Checks whether the current system prompt + tools match the cached golden base snapshot.
-     * If matched, restores it instantly into the slot (~20ms).
+     * Restore a validated runtime snapshot. Canonical golden may be a partial
+     * candidate; only llama-server can measure the actually reusable token prefix.
      */
     checkAndRestore(systemPrompt: string, slotId?: number, tools?: unknown[]): Promise<BaseCacheRestoreResult>;
+    private restoreBase;
     /**
      * Warms the base prompt by sending an evaluation request with n_predict=0,
      * then snapshots the resulting KV cache to disk as base_system_prompt.bin.

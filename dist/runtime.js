@@ -145,4 +145,38 @@ export class RuntimeQueue {
         return result;
     }
 }
+/**
+ * resolveRuntime() spawns `ss`, reads /proc and makes two HTTP calls (~0.1 s) and
+ * ran several times per request. Reuse a verified result while the same listener
+ * process is alive (pid + start time from /proc) and its LoRA adapters are
+ * unchanged; anything else, or 60 s, re-runs the full verification.
+ */
+export function cachedRuntimeResolver(resolve = resolveRuntime, ttlMs = 60_000, procRoot = "/proc", now = Date.now) {
+    const cache = new Map();
+    const adapters = async (value, signal) => {
+        const res = await boundedFetch(`${value.serverUrl}/lora-adapters`, {}, { signal, controlTimeoutMs: 2000, transport: value.transport });
+        if (!res.ok)
+            throw new Error(`Discovery HTTP ${res.status}`);
+        return res.text();
+    };
+    return async (baseUrl, io = {}) => {
+        const hit = cache.get(baseUrl);
+        if (hit && now() - hit.at < ttlMs) {
+            try {
+                const [pid, start] = hit.value.generation.split(":");
+                const stat = await fs.readFile(path.join(procRoot, pid, "stat"), "utf8");
+                if (stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[19] === start &&
+                    await adapters(hit.value, io.signal) === hit.adapters)
+                    return hit.value;
+            }
+            catch (error) {
+                io.signal?.throwIfAborted();
+            }
+            cache.delete(baseUrl);
+        }
+        const value = await resolve(baseUrl, io);
+        cache.set(baseUrl, { at: now(), value, adapters: await adapters(value, io.signal) });
+        return value;
+    };
+}
 //# sourceMappingURL=runtime.js.map

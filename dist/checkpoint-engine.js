@@ -14,11 +14,14 @@ export function sanitizeFilename(name) {
 }
 export async function saveSlot(baseUrl, slotId, filename, options = {}) {
     const url = `${baseUrl.replace(/\/+$/, "")}/slots/${slotId}?action=save`;
+    // Saving writes hundreds of MB and queues behind work already running on the
+    // slot (e.g. a speculative prefill), so it gets the long deadline: hitting the
+    // 5 s control deadline aborted the runtime and discarded the session's slot.
     const res = await boundedFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filename }),
-    }, options);
+    }, options, true);
     const data = (await res.json());
     if (!res.ok) {
         const msg = data.error?.message || `HTTP ${res.status} ${res.statusText}`;
@@ -32,7 +35,7 @@ export async function restoreSlot(baseUrl, slotId, filename, options = {}) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filename }),
-    }, options);
+    }, options, true); // same as save: heavy slot I/O, long deadline
     const data = (await res.json());
     if (!res.ok) {
         const msg = data.error?.message || `HTTP ${res.status} ${res.statusText}`;
@@ -74,8 +77,8 @@ export class CheckpointEngine {
         return `${this.config.snapshotPrefix ?? ""}snap_${sanitizeFilename(sessionId)}.bin`;
     }
     /**
-     * Evaluates token progress after a turn and executes an asynchronous,
-     * non-blocking snapshot save if threshold conditions are met.
+     * Evaluates token progress after a turn and awaits a serialized snapshot
+     * save if threshold conditions are met. Server disk I/O is synchronous.
      */
     async maybeCheckpoint(sessionId, sessionName, currentTokens, slotId = this.config.slotId, onSuccess, onError) {
         checkCancelled(this.config);
