@@ -47,6 +47,20 @@ export interface SnapshotMetadata {
     lastAccessedAt: string;
     promptPrefixHash: string;
     isBaseSnapshot?: boolean;
+    /** Golden only: context files and skills rendered into the golden prompt, as stat'ed at build time. */
+    resources?: ResourceStamp[];
+    /** Golden only: hash of the raw system prompt's opening, to tell the main agent from foreign prompts. */
+    headHash?: string;
+    /** Golden only: prompt keys of replaced goldens; a vote cannot bring them back. */
+    retired?: string[];
+    /** Golden only: why the current golden was (re)built. */
+    refreshReason?: string;
+}
+export interface ResourceStamp {
+    path: string;
+    /** -1 when the file changed after the builder process loaded it (its prompt may predate the edit). */
+    mtimeMs: number;
+    size: number;
 }
 export interface LlamaSlotActionResponse {
     id?: number;

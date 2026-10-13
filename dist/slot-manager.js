@@ -148,6 +148,21 @@ export class SlotManager {
         // ONLY check/warm if tools are provided (ensures full system prompt + tool schemas are present)
         if (this.config.enableBaseCache && systemPrompt && systemPrompt.length > 0 && tools !== undefined) {
             const baseRes = await this.baseCache.checkAndRestore(systemPrompt, targetSlotId, tools);
+            if (baseRes.rebuilt) {
+                // A stale golden was refreshed in this session's own slot, which now holds the exact new prefix.
+                checkCancelled(this.config);
+                this.activeSlotSessions.set(targetSlotId, sessionId);
+                return {
+                    slotId: targetSlotId,
+                    hit: false,
+                    restored: false,
+                    warmed: true,
+                    isBase: true,
+                    exactBase: true,
+                    tokens: baseRes.tokens,
+                    durationMs: baseRes.durationMs,
+                };
+            }
             if (baseRes.status === "hit" || baseRes.status === "partial") {
                 checkCancelled(this.config);
                 this.activeSlotSessions.set(targetSlotId, sessionId);

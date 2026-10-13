@@ -8,6 +8,58 @@ import { LruManager } from "./lru-manager.js";
 export const BASE_SNAPSHOT_BIN = "base_system_prompt.bin";
 export const BASE_SNAPSHOT_META = "base_system_prompt.meta.json";
 export const BASE_TOOLS_JSON = "base_tools.json";
+/** `/kv base-update` from a process that has no live prefix (piweb/Discord run each command in a fresh pi). */
+export const GOLDEN_REFRESH_REQUEST = "refresh.request";
+const GOLDEN_OBSERVED = "observed.json";
+const HEAD_CHARS = 512;
+const DAY_MS = 86_400_000;
+const RESOURCE_PATTERNS = [/<project_instructions path="([^"]+)">/g, /<location>([^<]+)<\/location>/g];
+const unescapeXml = (value) => value.replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+/** Context files and skills Pi rendered into a system prompt (absolute paths, prompt order). */
+export function extractResourcePaths(systemPrompt) {
+    const found = new Set();
+    for (const pattern of RESOURCE_PATTERNS) {
+        for (const match of systemPrompt.matchAll(pattern)) {
+            const file = unescapeXml(match[1].trim());
+            if (path.isAbsolute(file))
+                found.add(file);
+        }
+    }
+    return [...found];
+}
+/** The opening of Pi's prompt (identity + tool list) differs for subagents with their own system prompt. */
+export function promptHead(systemPrompt) {
+    return computeHash(`head:${systemPrompt.slice(0, HEAD_CHARS)}`);
+}
+export function goldenRefreshRequestPath(cacheDir, goldenPrefix) {
+    return path.join(cacheDir, `${goldenPrefix}${GOLDEN_REFRESH_REQUEST}`);
+}
+/** Schedules a golden rebuild for the next new session in `cwd`, which has the exact serialized prefix. */
+export async function requestGoldenRefresh(cacheDir, goldenPrefix, cwd) {
+    const file = goldenRefreshRequestPath(cacheDir, goldenPrefix);
+    await writeJsonAtomic(file, { requestedAt: new Date().toISOString(), cwd });
+    return file;
+}
+async function writeJsonAtomic(file, value, signal) {
+    const tmp = `${file}.${crypto.randomUUID()}.tmp`;
+    try {
+        await fs.writeFile(tmp, JSON.stringify(value, null, 2), { encoding: "utf-8", signal });
+        await fs.rename(tmp, file);
+    }
+    finally {
+        await fs.unlink(tmp).catch(() => { });
+    }
+}
+async function readJson(file) {
+    try {
+        return JSON.parse(await fs.readFile(file, "utf-8"));
+    }
+    catch {
+        return undefined;
+    }
+}
+const prefixKey = (hash, rendered) => `${hash}:${rendered ?? ""}`;
 export function stableStringify(obj) {
     if (obj === null || typeof obj !== "object") {
         return JSON.stringify(obj);
@@ -28,6 +80,8 @@ export function computeHash(content, tools) {
 export class BaseCacheManager {
     config;
     lru;
+    /** Decided while auditing a request; carried out by the next new session's golden restore. */
+    pendingRefresh;
     constructor(config, lru) {
         this.config = config.goldenPrefix ? { ...config, snapshotPrefix: config.goldenPrefix } : config;
         this.lru = config.goldenPrefix ? new LruManager(config.cacheDir, config.goldenPrefix, config.signal) : lru;
@@ -94,28 +148,135 @@ export class BaseCacheManager {
             await fs.rmdir(lock);
         }
     }
-    /** Audit every request; only a loaded-extension change or explicit update replaces golden. */
-    async ensureGolden(systemPrompt, tools, force = false) {
+    refreshRequestPath() {
+        return goldenRefreshRequestPath(this.config.cacheDir, this.config.goldenPrefix ?? "");
+    }
+    async log(record) {
+        const line = JSON.stringify({ ...record, timestamp: new Date().toISOString(), golden: this.getFilename() });
+        console.warn(`[pi-kv-cache-manager] ${line}`);
+        await fs.appendFile(path.join(this.config.cacheDir, "golden-warnings.jsonl"), `${line}\n`);
+    }
+    async stat(file) {
+        try {
+            return await fs.stat(file);
+        }
+        catch (error) {
+            checkCancelled(this.config, error);
+            return undefined;
+        }
+    }
+    /** A stamp is only trusted when the builder loaded the file after its last change. */
+    async stampResources(systemPrompt) {
+        const loadedAt = this.config.extensionLoadedAt ?? 0;
+        const stamps = [];
+        for (const file of extractResourcePaths(systemPrompt)) {
+            const st = await this.stat(file);
+            if (!st)
+                continue;
+            stamps.push(Math.max(st.mtimeMs, st.ctimeMs) > loadedAt ? { path: file, mtimeMs: -1, size: -1 }
+                : { path: file, mtimeMs: st.mtimeMs, size: st.size });
+        }
+        return stamps;
+    }
+    /**
+     * Which rendered context files/skills changed since golden was built: edited or deleted golden
+     * resources, plus files new to this prompt created after golden (an installed skill).
+     * `missing` lists golden resources that still exist but this prompt lacks (a reduced variant).
+     */
+    async resourceEvidence(systemPrompt, meta) {
+        const current = extractResourcePaths(systemPrompt);
+        const createdAt = Date.parse(meta.createdAt) || 0;
+        const recorded = new Map((meta.resources ?? []).map(stamp => [stamp.path, stamp]));
+        const changed = [];
+        const missing = [];
+        let newest = 0;
+        for (const stamp of recorded.values()) {
+            const st = await this.stat(stamp.path);
+            if (!st) {
+                changed.push(stamp.path);
+                continue;
+            }
+            if (!current.includes(stamp.path))
+                missing.push(stamp.path);
+            if (st.mtimeMs !== stamp.mtimeMs || st.size !== stamp.size) {
+                changed.push(stamp.path);
+                newest = Math.max(newest, st.mtimeMs, st.ctimeMs);
+            }
+        }
+        for (const file of current) {
+            if (recorded.has(file))
+                continue;
+            const st = await this.stat(file);
+            if (st && Math.max(st.mtimeMs, st.ctimeMs) > createdAt) {
+                changed.push(file);
+                newest = Math.max(newest, st.mtimeMs, st.ctimeMs);
+            }
+        }
+        return { changed, missing, newest };
+    }
+    /** Records that `sessionId` sent prefix `key`; returns the vote so far. */
+    async observe(key, sessionId) {
+        const file = path.join(this.config.cacheDir, `${this.config.goldenPrefix}${GOLDEN_OBSERVED}`);
+        const now = Date.now();
+        const store = (await readJson(file)) ?? {};
+        for (const [key, entry] of Object.entries(store))
+            if (now - entry.lastSeen > 7 * DAY_MS)
+                delete store[key];
+        const entry = store[key] ?? { sessions: [], firstSeen: now, lastSeen: now };
+        if (!entry.sessions.includes(sessionId))
+            entry.sessions = [...entry.sessions, sessionId].slice(-8);
+        entry.lastSeen = now;
+        store[key] = entry;
+        for (const stale of Object.keys(store).sort((a, b) => store[b].lastSeen - store[a].lastSeen).slice(32))
+            delete store[stale];
+        await writeJsonAtomic(file, store, this.config.signal);
+        return entry;
+    }
+    /**
+     * Silent refresh policy (canonical cwd, same extension set). The prompt must open like golden and
+     * keep every golden resource, so subagents and reduced variants never replace it. Then either a
+     * rendered context file/skill changed and this worker loaded it afterwards, or two sessions sent
+     * the same new prefix that was never golden before.
+     */
+    async planRefresh(systemPrompt, hash, meta, mismatch, extensionsChanged, sessionId) {
+        const rendered = this.config.renderedPrefixHash;
+        const request = await readJson(this.refreshRequestPath());
+        if (request && request.cwd === this.config.goldenCwd)
+            return { reason: "requested", hash, rendered };
+        if (!mismatch || extensionsChanged || meta.canonicalCwd !== this.config.goldenCwd)
+            return undefined;
+        if (meta.headHash && meta.headHash !== promptHead(systemPrompt))
+            return undefined;
+        const evidence = await this.resourceEvidence(systemPrompt, meta);
+        if (evidence.missing.length > 0)
+            return undefined;
+        if (evidence.changed.length > 0 && (this.config.extensionLoadedAt ?? 0) > evidence.newest) {
+            return { reason: "resources", hash, rendered };
+        }
+        const key = prefixKey(hash, rendered);
+        if (!sessionId || (meta.retired ?? []).includes(key))
+            return undefined;
+        const vote = await this.observe(key, sessionId);
+        return vote.sessions.length >= 2 && vote.firstSeen > (Date.parse(meta.createdAt) || 0)
+            ? { reason: "quorum", hash, rendered } : undefined;
+    }
+    /**
+     * Audit every request. A loaded-extension change or explicit update replaces golden now; a context
+     * file/skill edit, a repeated new prefix or a scheduled `/kv base-update` is carried out silently
+     * by the next new session's golden restore (see checkAndRestore).
+     */
+    async ensureGolden(systemPrompt, tools, force = false, options = {}) {
         if ((!this.config.enableBaseCache && !force) || !this.config.goldenPrefix)
             return;
         await this.withGoldenLock(async () => {
             await this.config.assertCurrent?.();
+            this.pendingRefresh = undefined;
             const meta = await this.getBaseMetadata();
             const hash = computeHash(systemPrompt, tools);
             const mismatch = !!meta && (meta.promptPrefixHash !== hash || meta.renderedPrefixHash !== this.config.renderedPrefixHash);
             const changed = !!meta && !!this.config.extensionsFingerprint && meta.extensionsFingerprint !== this.config.extensionsFingerprint;
             const canUpdate = changed && meta?.canonicalCwd === this.config.goldenCwd &&
                 (this.config.extensionLoadedAt ?? 0) > (meta?.extensionLoadedAt ?? 0);
-            if (mismatch || changed) {
-                const warning = { type: "golden_mismatch", timestamp: new Date().toISOString(),
-                    golden: this.getFilename(), expectedHash: meta?.promptPrefixHash, actualHash: hash,
-                    expectedRenderedHash: meta?.renderedPrefixHash, actualRenderedHash: this.config.renderedPrefixHash,
-                    expectedExtensions: meta?.extensionsFingerprint, actualExtensions: this.config.extensionsFingerprint,
-                    canonicalCwd: meta?.canonicalCwd, cwd: this.config.goldenCwd,
-                    action: force || canUpdate ? "update" : "preserve" };
-                console.warn(`[pi-kv-cache-manager] ${JSON.stringify(warning)}`);
-                await fs.appendFile(path.join(this.config.cacheDir, "golden-warnings.jsonl"), `${JSON.stringify(warning)}\n`);
-            }
             let present = false;
             try {
                 await fs.access(this.getBinPath());
@@ -124,69 +285,145 @@ export class BaseCacheManager {
             catch (error) {
                 checkCancelled(this.config, error);
             }
-            if (meta && present && !force && !canUpdate)
+            const deferred = meta && present && !force && !canUpdate;
+            if (deferred)
+                this.pendingRefresh = await this.planRefresh(systemPrompt, hash, meta, mismatch, changed, options.sessionId);
+            if (mismatch || changed) {
+                await this.log({ type: "golden_mismatch",
+                    expectedHash: meta?.promptPrefixHash, actualHash: hash,
+                    expectedRenderedHash: meta?.renderedPrefixHash, actualRenderedHash: this.config.renderedPrefixHash,
+                    expectedExtensions: meta?.extensionsFingerprint, actualExtensions: this.config.extensionsFingerprint,
+                    canonicalCwd: meta?.canonicalCwd, cwd: this.config.goldenCwd,
+                    action: !deferred ? "update" : this.pendingRefresh ? `refresh-next-session:${this.pendingRefresh.reason}` : "preserve" });
+            }
+            if (deferred)
                 return;
-            // A unique staging snapshot keeps the previous golden usable if warm/save fails.
-            const prefix = `${this.config.goldenPrefix}build_${crypto.randomUUID()}_`;
-            const stageConfig = { ...this.config, goldenPrefix: undefined, snapshotPrefix: prefix };
-            const stage = new BaseCacheManager(stageConfig, new LruManager(this.config.cacheDir, prefix, this.config.signal));
-            const suffixes = ["", ".dft", ".ckpt", ".media.json"];
-            const backups = [];
-            const installed = [];
-            let committed = false;
-            try {
-                await stage.warmAndSave(systemPrompt, hash, undefined, tools);
-                const saved = await stage.getBaseMetadata();
-                if (!saved || saved.tokenCount <= 0)
-                    throw new Error("Golden staging metadata unavailable");
-                await this.config.assertCurrent?.();
-                for (const suffix of [...suffixes, ".meta.json", ".tools.json"]) {
-                    const target = suffix === ".meta.json" ? this.getMetaPath() : suffix === ".tools.json" ? this.getToolsPath() : this.getBinPath() + suffix;
-                    const source = suffix === ".meta.json" ? stage.getMetaPath() : suffix === ".tools.json" ? stage.getToolsPath() : stage.getBinPath() + suffix;
-                    const backup = `${target}.${crypto.randomUUID()}.backup`;
-                    try {
-                        await fs.rename(target, backup);
-                        backups.push({ target, backup });
-                    }
-                    catch (error) {
-                        if (error.code !== "ENOENT")
-                            throw error;
-                    }
-                    if (suffix === ".meta.json")
-                        continue;
-                    try {
-                        await fs.rename(source, target);
-                        installed.push(target);
-                    }
-                    catch (error) {
-                        if (error.code !== "ENOENT" || suffix === "")
-                            throw error;
-                    }
-                }
-                const published = { ...saved, namespace: this.config.goldenPrefix, canonicalCwd: this.config.goldenCwd,
-                    renderedPrefixHash: this.config.renderedPrefixHash, extensionsFingerprint: this.config.extensionsFingerprint,
-                    extensionLoadedAt: this.config.extensionLoadedAt };
-                await fs.writeFile(stage.getMetaPath(), JSON.stringify(published, null, 2), { signal: this.config.signal });
-                checkCancelled(this.config);
-                await fs.rename(stage.getMetaPath(), this.getMetaPath());
-                committed = true;
-            }
-            finally {
-                if (!committed) {
-                    for (const target of installed)
-                        await fs.unlink(target).catch(() => { });
-                    for (const { target, backup } of backups.reverse())
-                        await fs.rename(backup, target);
-                }
-                else {
-                    for (const { backup } of backups)
-                        await fs.unlink(backup).catch(() => { });
-                }
-                for (const file of [stage.getBinPath(), ...suffixes.slice(1).map(s => stage.getBinPath() + s), stage.getMetaPath(), stage.getToolsPath()]) {
-                    await fs.unlink(file).catch(() => { });
-                }
-            }
+            await this.rebuild(systemPrompt, tools, hash, { reason: force ? "explicit" : !meta ? "cold" : canUpdate ? "extensions" : "missing-binary" });
         });
+    }
+    /**
+     * Warm, save and publish a new golden (caller holds the golden lock). `seed` restores the current
+     * golden into `slotId` first, so llama-server re-prefills only the changed suffix of the prefix.
+     */
+    async rebuild(systemPrompt, tools, hash, options) {
+        const started = Date.now();
+        const previous = await this.getBaseMetadata();
+        let seed;
+        if (options.seed && previous) {
+            try {
+                await fs.access(this.getBinPath());
+                seed = this.getFilename();
+            }
+            catch (error) {
+                checkCancelled(this.config, error);
+            }
+        }
+        // A unique staging snapshot keeps the previous golden usable if warm/save fails.
+        const prefix = `${this.config.goldenPrefix}build_${crypto.randomUUID()}_`;
+        const stageConfig = { ...this.config, goldenPrefix: undefined, snapshotPrefix: prefix };
+        const stage = new BaseCacheManager(stageConfig, new LruManager(this.config.cacheDir, prefix, this.config.signal));
+        const suffixes = ["", ".dft", ".ckpt", ".media.json"];
+        const backups = [];
+        const installed = [];
+        let committed = false;
+        let tokens = 0;
+        let seeded = false;
+        try {
+            seeded = (await stage.warmAndSave(systemPrompt, hash, options.slotId, tools, seed)).seeded;
+            const saved = await stage.getBaseMetadata();
+            if (!saved || saved.tokenCount <= 0)
+                throw new Error("Golden staging metadata unavailable");
+            tokens = saved.tokenCount;
+            await this.config.assertCurrent?.();
+            for (const suffix of [...suffixes, ".meta.json", ".tools.json"]) {
+                const target = suffix === ".meta.json" ? this.getMetaPath() : suffix === ".tools.json" ? this.getToolsPath() : this.getBinPath() + suffix;
+                const source = suffix === ".meta.json" ? stage.getMetaPath() : suffix === ".tools.json" ? stage.getToolsPath() : stage.getBinPath() + suffix;
+                const backup = `${target}.${crypto.randomUUID()}.backup`;
+                try {
+                    await fs.rename(target, backup);
+                    backups.push({ target, backup });
+                }
+                catch (error) {
+                    if (error.code !== "ENOENT")
+                        throw error;
+                }
+                if (suffix === ".meta.json")
+                    continue;
+                try {
+                    await fs.rename(source, target);
+                    installed.push(target);
+                }
+                catch (error) {
+                    if (error.code !== "ENOENT" || suffix === "")
+                        throw error;
+                }
+            }
+            const key = prefixKey(hash, this.config.renderedPrefixHash);
+            const retired = previous ? [prefixKey(previous.promptPrefixHash, previous.renderedPrefixHash), ...(previous.retired ?? [])]
+                .filter((k, i, all) => k !== key && all.indexOf(k) === i).slice(0, 8) : [];
+            const published = { ...saved, namespace: this.config.goldenPrefix, canonicalCwd: this.config.goldenCwd,
+                renderedPrefixHash: this.config.renderedPrefixHash, extensionsFingerprint: this.config.extensionsFingerprint,
+                extensionLoadedAt: this.config.extensionLoadedAt, headHash: promptHead(systemPrompt),
+                resources: await this.stampResources(systemPrompt), retired, refreshReason: options.reason };
+            await fs.writeFile(stage.getMetaPath(), JSON.stringify(published, null, 2), { signal: this.config.signal });
+            checkCancelled(this.config);
+            await fs.rename(stage.getMetaPath(), this.getMetaPath());
+            committed = true;
+        }
+        finally {
+            if (!committed) {
+                for (const target of installed)
+                    await fs.unlink(target).catch(() => { });
+                for (const { target, backup } of backups.reverse())
+                    await fs.rename(backup, target);
+            }
+            else {
+                for (const { backup } of backups)
+                    await fs.unlink(backup).catch(() => { });
+            }
+            for (const file of [stage.getBinPath(), ...suffixes.slice(1).map(s => stage.getBinPath() + s), stage.getMetaPath(), stage.getToolsPath()]) {
+                await fs.unlink(file).catch(() => { });
+            }
+        }
+        const request = await readJson(this.refreshRequestPath());
+        if (request && request.cwd === this.config.goldenCwd)
+            await fs.unlink(this.refreshRequestPath()).catch(() => { });
+        const durationMs = Date.now() - started;
+        await this.log({ type: "golden_refreshed", reason: options.reason, seeded, slot: options.slotId, tokens, durationMs,
+            promptHash: hash, renderedHash: this.config.renderedPrefixHash, cwd: this.config.goldenCwd });
+        return { tokens, durationMs };
+    }
+    /** Carry out the refresh planned for this prefix, unless another worker already published it. */
+    async performPendingRefresh(systemPrompt, slotId, tools) {
+        const pending = this.pendingRefresh;
+        this.pendingRefresh = undefined;
+        if (!pending)
+            return undefined;
+        const effectiveTools = tools ?? await this.loadCachedTools() ?? [];
+        const hash = computeHash(systemPrompt, effectiveTools);
+        if (hash !== pending.hash || this.config.renderedPrefixHash !== pending.rendered)
+            return undefined;
+        const meta = await this.getBaseMetadata();
+        if (meta && meta.promptPrefixHash === hash && meta.renderedPrefixHash === pending.rendered) {
+            // Already current (another worker refreshed it, or base-update found nothing stale). A seeded
+            // warm of an identical prompt is not even cheap: llama-server must re-evaluate the last token,
+            // cannot truncate recurrent state in place and re-prefills everything.
+            if (pending.reason === "requested") {
+                await fs.unlink(this.refreshRequestPath()).catch(() => { });
+                await this.log({ type: "golden_refresh_skipped", reason: pending.reason, why: "golden already matches this prefix",
+                    promptHash: hash, cwd: this.config.goldenCwd });
+            }
+            return undefined;
+        }
+        try {
+            const result = await this.rebuild(systemPrompt, effectiveTools, hash, { reason: pending.reason, slotId, seed: true });
+            return { status: "hit", hash, tokens: result.tokens, durationMs: result.durationMs, rebuilt: pending.reason };
+        }
+        catch (error) {
+            checkCancelled(this.config, error);
+            console.warn(`[pi-kv-cache-manager] Golden refresh failed; previous golden preserved: ${String(error)}`);
+            return undefined;
+        }
     }
     /**
      * Restore a validated runtime snapshot. Canonical golden may be a partial
@@ -194,7 +431,7 @@ export class BaseCacheManager {
      */
     async checkAndRestore(systemPrompt, slotId = this.config.slotId, tools) {
         if (this.config.goldenPrefix && this.config.enableBaseCache) {
-            return this.withGoldenLock(() => this.restoreBase(systemPrompt, slotId, tools));
+            return this.withGoldenLock(async () => await this.performPendingRefresh(systemPrompt, slotId, tools) ?? this.restoreBase(systemPrompt, slotId, tools));
         }
         return this.restoreBase(systemPrompt, slotId, tools);
     }
@@ -248,9 +485,9 @@ export class BaseCacheManager {
      * Warms the base prompt by sending an evaluation request with n_predict=0,
      * then snapshots the resulting KV cache to disk as base_system_prompt.bin.
      * Dynamically selects an idle slot (or uses preferredSlotId), formats with /apply-template,
-     * and cleanly erases the slot before prefilling.
+     * and cleanly erases the slot before prefilling (or restores `seedFilename` into it instead).
      */
-    async warmAndSave(systemPrompt, hash, preferredSlotId, tools) {
+    async warmAndSave(systemPrompt, hash, preferredSlotId, tools, seedFilename) {
         checkCancelled(this.config);
         await this.config.assertCurrent?.();
         const baseUrl = this.config.llamaServerUrl.replace(/\/+$/, "");
@@ -303,13 +540,27 @@ export class BaseCacheManager {
         }
         checkCancelled(this.config);
         await this.config.assertCurrent?.();
-        // 3. Erase target slot first to guarantee a pure, clean prefill (no leftover tokens)
-        try {
-            await eraseSlot(this.config.llamaServerUrl, targetSlot, this.config);
+        // 3. Start from the previous golden when seeding: llama-server keeps the common token prefix
+        // (restoring a context checkpoint) and prefills only the changed suffix. Restore, like erase,
+        // first saves any unsaved owner state of the slot. Otherwise erase for a pure, clean prefill.
+        let seeded = false;
+        if (seedFilename) {
+            try {
+                await restoreSlot(this.config.llamaServerUrl, targetSlot, seedFilename, this.config);
+                seeded = true;
+            }
+            catch (error) {
+                checkCancelled(this.config, error);
+            }
         }
-        catch (error) {
-            checkCancelled(this.config, error);
-            // Ignore if slot was already clean
+        if (!seeded) {
+            try {
+                await eraseSlot(this.config.llamaServerUrl, targetSlot, this.config);
+            }
+            catch (error) {
+                checkCancelled(this.config, error);
+                // Ignore if slot was already clean
+            }
         }
         // 4. Evaluate formatted prompt with n_predict = 0 to fill slot KV cache
         const completionUrl = `${baseUrl}/completion`;
@@ -354,6 +605,7 @@ export class BaseCacheManager {
             durationMs,
             bytes: savedBytes,
             slotId: targetSlot,
+            seeded,
         };
     }
 }

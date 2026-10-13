@@ -29,3 +29,24 @@ test('cached runtime: reused while the listener process and adapters are unchang
   await cached('http://127.0.0.1:8001/v1');
   assert.equal(resolves, 4, 'TTL expiry forces a full resolve');
 });
+
+test('a verified runtime survives /lora-adapters queued behind a busy main loop (e.g. 2 s image encode)', async t => {
+  const proc = await fs.mkdtemp(path.join(os.tmpdir(), 'kv-proc-'));
+  t.after(() => fs.rm(proc, { recursive: true, force: true }));
+  await fs.mkdir(path.join(proc, '42'));
+  await fs.writeFile(path.join(proc, '42', 'stat'), `42 (llama-server) S ${'0 '.repeat(18)}1000 0`);
+  let delayMs = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, delayMs);
+      init?.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(init.signal.reason); });
+    });
+    return new Response('[]');
+  };
+  t.after(() => { globalThis.fetch = original; });
+  const cached = cachedRuntimeResolver(async () => ({ serverUrl: 'http://127.0.0.1:8001', generation: '42:1000:7', identity: 'id' }), 60_000, proc);
+  await cached('http://127.0.0.1:8001/v1');
+  delayMs = 2200;
+  assert.equal((await cached('http://127.0.0.1:8001/v1')).identity, 'id');
+});

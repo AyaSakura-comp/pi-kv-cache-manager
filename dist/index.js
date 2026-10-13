@@ -3,7 +3,7 @@ import { DEFAULT_CONFIG, loadConfig } from "./config.js";
 import { cachedRuntimeResolver, RuntimeQueue } from "./runtime.js";
 import { LruManager } from "./lru-manager.js";
 import { CheckpointEngine, saveSlot, restoreSlot, fetchSlots } from "./checkpoint-engine.js";
-import { BaseCacheManager, computeHash, stableStringify } from "./base-cache.js";
+import { BaseCacheManager, computeHash, requestGoldenRefresh, stableStringify } from "./base-cache.js";
 import { SlotManager } from "./slot-manager.js";
 import { boundedFetch, checkCancelled } from "./request.js";
 const STATUS_KEY = "kv-cache";
@@ -325,7 +325,7 @@ export default function piKvCacheManager(pi, dependencies = {}) {
         let slotId;
         try {
             try {
-                await baseCache.ensureGolden(systemPrompt, tools ?? []);
+                await baseCache.ensureGolden(systemPrompt, tools ?? [], false, { sessionId: ctx.sessionManager?.getSessionId() });
             }
             catch (error) {
                 checkCancelled(config, error);
@@ -448,6 +448,28 @@ export default function piKvCacheManager(pi, dependencies = {}) {
         }
         invalidate();
     });
+    // piweb and the Discord gateway run every slash command in a fresh one-shot pi process that never
+    // sent a request, so it has no verified prefix to warm. Leave a request file next to golden: the next
+    // new session in this cwd rebuilds golden from its exact serialized prefix (see BaseCacheManager).
+    const scheduleGoldenRefresh = async (ctx, signal) => {
+        const model = ctx.model;
+        if (!isLlamaServerContext(ctx, config) || !model?.baseUrl) {
+            notifyUser(ctx, `⚠️ Base cache update is only available for local llama-server models.`, "warning");
+            return;
+        }
+        try {
+            const resolved = await discover(model.baseUrl, { signal });
+            signal.throwIfAborted();
+            await requestGoldenRefresh(resolved.cacheDir, `golden_${computeHash(resolved.identity)}_`, ctx.cwd);
+            notifyUser(ctx, `🗓️ Golden Base refresh scheduled for \`${ctx.cwd}\`: the next new session there rebuilds it from its real ` +
+                `request prefix (seeded from the current golden, in its own slot). No slot was touched now.`, "info");
+        }
+        catch (err) {
+            if (signal.aborted)
+                return;
+            notifyUser(ctx, `❌ Could not schedule a Golden Base refresh: ${err instanceof Error ? err.message : String(err)}`, "error");
+        }
+    };
     // Slash Commands: /kv [status|save|restore|prune|base-update|help]
     pi.registerCommand("kv", {
         description: "Manage llama.cpp slot KV cache snapshots and lifecycle",
@@ -465,6 +487,10 @@ export default function piKvCacheManager(pi, dependencies = {}) {
                     return;
                 const args = rawArgs.trim().split(/\s+/).filter(Boolean);
                 const sub = (args[0] || "status").toLowerCase();
+                if (sub === "base-update" && !(await verifyActive(ctx) && lastPrefix)) {
+                    await scheduleGoldenRefresh(ctx, signal);
+                    return;
+                }
                 if (sub !== "help" && !await verifyActive(ctx)) {
                     notifyUser(ctx, "Persistent KV unavailable: send a request to a verified local llama-server first. No files changed.", "warning");
                     return;
@@ -657,7 +683,7 @@ export default function piKvCacheManager(pi, dependencies = {}) {
                             `- \`/kv save [name]\` : Manually snapshot current session or named file\n` +
                             `- \`/kv restore [name]\` : Restore session or named snapshot\n` +
                             `- \`/kv prune\` : Enforce LRU session count and storage quotas\n` +
-                            `- \`/kv base-update\` : Re-evaluate and cache Golden Base System Prompt\n` +
+                            `- \`/kv base-update\` : Re-evaluate and cache Golden Base System Prompt (without a prior request in this process, e.g. piweb: scheduled for the next new session)\n` +
                             `- \`/kv help\` : Show this help message`, "info");
                         break;
                     }

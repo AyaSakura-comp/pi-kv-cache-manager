@@ -15,6 +15,13 @@ export interface DiscoveryIO {
     listener?: (port: number) => Promise<string>;
     json?: (url: string) => Promise<any>;
 }
+/**
+ * llama-server answers /props and /lora-adapters from its main loop, so they queue behind
+ * whatever the loop is doing (a 2048-token ubatch, a 2-3 s image encode). A 2 s deadline
+ * timed out under load; the TimeoutError was treated as cancellation and silently discarded
+ * finished golden warms and slot bindings. A dead server still fails within this bound.
+ */
+export declare const DISCOVERY_TIMEOUT_MS = 30000;
 /** Only direct, same-namespace Linux listeners are supported. No pgrep or shell. */
 export declare function resolveRuntime(baseUrl: string, io?: DiscoveryIO): Promise<ResolvedRuntime>;
 /** One queue covers provider activation, saves, commands and shutdown. No detached jobs. */

@@ -6,6 +6,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { computeHash, stableStringify } from "./base-cache.js";
 const exec = promisify(execFile);
+/**
+ * llama-server answers /props and /lora-adapters from its main loop, so they queue behind
+ * whatever the loop is doing (a 2048-token ubatch, a 2-3 s image encode). A 2 s deadline
+ * timed out under load; the TimeoutError was treated as cancellation and silently discarded
+ * finished golden warms and slot bindings. A dead server still fails within this bound.
+ */
+export const DISCOVERY_TIMEOUT_MS = 30_000;
 function argument(argv, names) {
     const values = [];
     for (let i = 1; i < argv.length; i++) {
@@ -92,7 +99,7 @@ export async function resolveRuntime(baseUrl, io = {}) {
     const before = await inspect();
     const serverUrl = url.origin;
     const get = io.json ?? (async (url) => {
-        const res = await boundedFetch(url, {}, { signal: io.signal, controlTimeoutMs: 2000, transport });
+        const res = await boundedFetch(url, {}, { signal: io.signal, controlTimeoutMs: DISCOVERY_TIMEOUT_MS, transport });
         if (!res.ok)
             throw new Error(`Discovery HTTP ${res.status}`);
         return res.json();
@@ -154,7 +161,7 @@ export class RuntimeQueue {
 export function cachedRuntimeResolver(resolve = resolveRuntime, ttlMs = 60_000, procRoot = "/proc", now = Date.now) {
     const cache = new Map();
     const adapters = async (value, signal) => {
-        const res = await boundedFetch(`${value.serverUrl}/lora-adapters`, {}, { signal, controlTimeoutMs: 2000, transport: value.transport });
+        const res = await boundedFetch(`${value.serverUrl}/lora-adapters`, {}, { signal, controlTimeoutMs: DISCOVERY_TIMEOUT_MS, transport: value.transport });
         if (!res.ok)
             throw new Error(`Discovery HTTP ${res.status}`);
         return res.text();
