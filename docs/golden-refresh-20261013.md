@@ -72,3 +72,21 @@ Golden metadata gains `resources` (path/mtime/size; `-1` when the file changed a
 ## Deployment
 
 `~/.pi/agent/extensions/pi-kv-cache-manager` is a symlink to this checkout, and settings load `dist/index.js`. Rebuilding `dist/` deploys it: new pi processes load it, and running workers reload changed extension sources at their next idle prompt. The server and Pi core are unchanged from the 2026-10-05 baseline. piweb was not changed.
+
+## Follow-up: extension updates (2026-10-13, later)
+
+Extension changes used to rebuild golden cold, inside whichever canonical-cwd request noticed first, in the first idle slot (possibly evicting another session). Now:
+
+- **Prefix unchanged** (extension code changed, but no prompt/tool text did): golden metadata adopts the new extension fingerprint, no warm (`golden_refresh_skipped`, `prefix unchanged; extension set adopted`).
+- **Prefix changed**: planned as `refresh-next-session:extensions` and carried out by the next new session in its own slot, seeded from the old golden. Old workers still cannot roll it back.
+
+Live, piweb-style `pi -p hello` sessions:
+
+| Case | Before | After |
+|---|---|---|
+| KV extension's own dist rebuilt (prefix unchanged) | 19 s run, 26,884-token cold warm | **3.1 s**, 53 tokens prefilled |
+| Temporary extension adds one tool | 15.7 s cold warm, first idle slot | 15.7 s seeded warm, **own slot 1** (`n_past = 2749`) |
+| Same tool removed | same | 15.6 s, own slot |
+| Following new sessions | 53 tokens | 53 tokens, ~3 s run |
+
+The seed gains nothing for tool changes: Qwen's chat template renders `# Tools … <tools>` first in the system message (`<tools>` at char 73, system text at char 1029 in `/apply-template`), so a tool edit diverges at ~2.7k tokens. That is below the first recurrent (GDN) context checkpoint, so llama-server re-prefills the whole prefix. Only edits that change the system text late in the prompt (skills, AGENTS.md, extension prompt snippets) benefit from seeding.

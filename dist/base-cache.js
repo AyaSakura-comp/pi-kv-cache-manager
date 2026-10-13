@@ -261,9 +261,9 @@ export class BaseCacheManager {
             ? { reason: "quorum", hash, rendered } : undefined;
     }
     /**
-     * Audit every request. A loaded-extension change or explicit update replaces golden now; a context
+     * Audit every request. An explicit update replaces golden now; a loaded-extension change, a context
      * file/skill edit, a repeated new prefix or a scheduled `/kv base-update` is carried out silently
-     * by the next new session's golden restore (see checkAndRestore).
+     * by the next new session's golden restore (see checkAndRestore), seeded from the old golden.
      */
     async ensureGolden(systemPrompt, tools, force = false, options = {}) {
         if ((!this.config.enableBaseCache && !force) || !this.config.goldenPrefix)
@@ -285,9 +285,23 @@ export class BaseCacheManager {
             catch (error) {
                 checkCancelled(this.config, error);
             }
-            const deferred = meta && present && !force && !canUpdate;
+            // A loaded-extension change is carried out like a resource refresh: seeded, in the next new
+            // session's own slot, instead of a cold warm in whichever slot is idle now.
+            if (meta && present && !force && canUpdate && !mismatch) {
+                // Extension code changed but the rendered prefix did not: the KV is still exact, adopt the set.
+                const adopted = { ...meta, extensionsFingerprint: this.config.extensionsFingerprint,
+                    extensionLoadedAt: this.config.extensionLoadedAt, refreshReason: "extensions-adopted" };
+                const tmp = `${this.getMetaPath()}.${crypto.randomUUID()}.tmp`;
+                await fs.writeFile(tmp, JSON.stringify(adopted, null, 2), { signal: this.config.signal });
+                await fs.rename(tmp, this.getMetaPath());
+                await this.log({ type: "golden_refresh_skipped", reason: "extensions", why: "prefix unchanged; extension set adopted",
+                    promptHash: hash, actualExtensions: this.config.extensionsFingerprint, cwd: this.config.goldenCwd });
+                return;
+            }
+            const deferred = meta && present && !force;
             if (deferred)
-                this.pendingRefresh = await this.planRefresh(systemPrompt, hash, meta, mismatch, changed, options.sessionId);
+                this.pendingRefresh = canUpdate ? { reason: "extensions", hash, rendered: this.config.renderedPrefixHash }
+                    : await this.planRefresh(systemPrompt, hash, meta, mismatch, changed, options.sessionId);
             if (mismatch || changed) {
                 await this.log({ type: "golden_mismatch",
                     expectedHash: meta?.promptPrefixHash, actualHash: hash,
@@ -298,7 +312,7 @@ export class BaseCacheManager {
             }
             if (deferred)
                 return;
-            await this.rebuild(systemPrompt, tools, hash, { reason: force ? "explicit" : !meta ? "cold" : canUpdate ? "extensions" : "missing-binary" });
+            await this.rebuild(systemPrompt, tools, hash, { reason: force ? "explicit" : !meta ? "cold" : "missing-binary" });
         });
     }
     /**

@@ -523,7 +523,7 @@ export default function piKvCacheManager(pi, dependencies = {}) {
                             `- **Golden Warnings**: \`${path.join(config.cacheDir, "golden-warnings.jsonl")}\``,
                             `- **Loaded Extensions**: \`${extensionsFingerprint ?? "unavailable; reload updated pi core"}\``,
                             `- **Golden Extensions**: \`${baseMeta?.extensionsFingerprint ?? "unset"}\``,
-                            `- **Pending Golden Update**: ${extensionsFingerprint && baseMeta?.extensionsFingerprint !== extensionsFingerprint ? "yes (next serialized request in canonical cwd)" : "no"}`,
+                            `- **Pending Golden Update**: ${extensionsFingerprint && baseMeta?.extensionsFingerprint !== extensionsFingerprint ? "yes (next new session in canonical cwd, seeded)" : "no"}`,
                             "",
                         ];
                         try {

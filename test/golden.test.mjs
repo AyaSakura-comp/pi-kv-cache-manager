@@ -48,10 +48,35 @@ test('base-cache disabled stays disabled unless the user explicitly forces base-
 test('extension update refreshes once, same fingerprint does not, old loaded worker cannot roll it back',async t=>{
  const f=await fixture(t);await f.manager().ensureGolden('prefix',[]);
  const updated=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2,renderedPrefixHash:'new'});
- await updated.ensureGolden('new prefix',[]);await updated.ensureGolden('new prefix',[]);
- await f.manager().ensureGolden('prefix',[]);
+ await updated.ensureGolden('new prefix',[]);
+ assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,1,'audit only plans the refresh');
+ const restored=await updated.checkAndRestore('new prefix',1,[]);
+ assert.equal(restored.rebuilt,'extensions');
+ await updated.ensureGolden('new prefix',[]);await updated.checkAndRestore('new prefix',1,[]);
+ const old=f.manager();await old.ensureGolden('prefix',[]);await old.checkAndRestore('prefix',0,[]);
  assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,2);
  assert.equal((await updated.getBaseMetadata()).extensionsFingerprint,'v2');
+});
+test('extension refresh is seeded from the old golden in the new session slot',async t=>{
+ const f=await fixture(t);const first=f.manager();await first.ensureGolden('prefix',[]);const oldGolden=first.getFilename();
+ const updated=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2,renderedPrefixHash:'new'});
+ const mark=f.calls.length;await updated.ensureGolden('new prefix',[{name:'tool2'}]);await updated.checkAndRestore('new prefix',1,[{name:'tool2'}]);
+ const calls=f.calls.slice(mark);
+ const restore=calls.findIndex(c=>c.url.includes('/slots/1?action=restore')&&c.body.filename===oldGolden);
+ const warm=calls.findIndex(c=>c.url.endsWith('/completion'));
+ assert.ok(restore>=0&&warm>restore,'old golden restored into slot 1 before the warm');
+ assert.equal(warm>=0&&calls[warm].body.id_slot,1);
+ const log=(await fs.readFile(path.join(f.root,'golden-warnings.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+ assert.ok(log.some(r=>r.type==='golden_refreshed'&&r.reason==='extensions'&&r.seeded===true&&r.slot===1));
+});
+test('extension change with an unchanged prefix adopts the new set without a warm',async t=>{
+ const f=await fixture(t);await f.manager().ensureGolden('prefix',[]);
+ const updated=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2});
+ await updated.ensureGolden('prefix',[]);await updated.checkAndRestore('prefix',0,[]);
+ assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,1);
+ const meta=await updated.getBaseMetadata();assert.equal(meta.extensionsFingerprint,'v2');assert.equal(meta.extensionLoadedAt,2);
+ await f.manager().ensureGolden('prefix',[]);
+ assert.equal((await updated.getBaseMetadata()).extensionsFingerprint,'v2','older worker cannot roll the set back');
 });
 test('foreign cwd cannot replace the canonical golden on an extension-set change',async t=>{
  const f=await fixture(t);await f.manager().ensureGolden('prefix',[]);
@@ -60,9 +85,12 @@ test('foreign cwd cannot replace the canonical golden on an extension-set change
 });
 test('failed extension refresh preserves the previous binary and metadata and can retry',async t=>{
  const f=await fixture(t);const old=f.manager();await old.ensureGolden('prefix',[]);const meta=await fs.readFile(old.getMetaPath(),'utf8');
- f.failWarm();await assert.rejects(f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2}).ensureGolden('new',[]),/warm/);
- assert.equal(await fs.readFile(old.getMetaPath(),'utf8'),meta);assert.equal(await fs.readFile(old.getBinPath()+'.ckpt','utf8'),'checkpoint');
+ f.failWarm();const failing=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2});await failing.ensureGolden('new',[]);
+ assert.notEqual((await failing.checkAndRestore('new',0,[])).rebuilt,'extensions');
+ const {lastAccessedAt:_a,...before}=JSON.parse(meta);const {lastAccessedAt:_b,...after}=JSON.parse(await fs.readFile(old.getMetaPath(),'utf8'));
+ assert.deepEqual(after,before,'fallback restore only touches lastAccessedAt');assert.equal(await fs.readFile(old.getBinPath()+'.ckpt','utf8'),'checkpoint');
  f.failWarm(false);const retry=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2});await retry.ensureGolden('new',[]);
+ assert.equal((await retry.checkAndRestore('new',0,[])).rebuilt,'extensions');
  assert.equal((await retry.getBaseMetadata()).extensionsFingerprint,'v2');
 });
 test('concurrent cold managers warm only once',async t=>{

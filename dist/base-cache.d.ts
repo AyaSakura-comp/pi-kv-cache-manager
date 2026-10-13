@@ -12,7 +12,7 @@ export declare function promptHead(systemPrompt: string): string;
 export declare function goldenRefreshRequestPath(cacheDir: string, goldenPrefix: string): string;
 /** Schedules a golden rebuild for the next new session in `cwd`, which has the exact serialized prefix. */
 export declare function requestGoldenRefresh(cacheDir: string, goldenPrefix: string, cwd: string): Promise<string>;
-type RefreshReason = "requested" | "resources" | "quorum";
+type RefreshReason = "requested" | "resources" | "quorum" | "extensions";
 export declare function stableStringify(obj: unknown): string;
 export declare function computeHash(content: string, tools?: unknown[]): string;
 export interface BaseCacheRestoreResult {
@@ -59,9 +59,9 @@ export declare class BaseCacheManager {
      */
     private planRefresh;
     /**
-     * Audit every request. A loaded-extension change or explicit update replaces golden now; a context
+     * Audit every request. An explicit update replaces golden now; a loaded-extension change, a context
      * file/skill edit, a repeated new prefix or a scheduled `/kv base-update` is carried out silently
-     * by the next new session's golden restore (see checkAndRestore).
+     * by the next new session's golden restore (see checkAndRestore), seeded from the old golden.
      */
     ensureGolden(systemPrompt: string, tools: unknown[], force?: boolean, options?: {
         sessionId?: string;
