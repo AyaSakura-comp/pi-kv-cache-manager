@@ -1,0 +1,4 @@
+#!/bin/sh
+# Pi runs <agentDir>/hooks/after-package-change <install|remove|update> <source> after a package
+# command. Link this file there to refresh the KV golden in the background.
+exec /usr/bin/python3 "$(dirname "$(readlink -f "$0")")/golden-prewarm.py" "pi $1 $2"

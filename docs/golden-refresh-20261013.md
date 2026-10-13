@@ -91,15 +91,21 @@ Live, piweb-style `pi -p hello` sessions:
 
 The seed gains nothing for tool changes: Qwen's chat template renders `# Tools … <tools>` first in the system message (`<tools>` at char 73, system text at char 1029 in `/apply-template`), so a tool edit diverges at ~2.7k tokens. That is below the first recurrent (GDN) context checkpoint, so llama-server re-prefills the whole prefix. Only edits that change the system text late in the prompt (skills, AGENTS.md, extension prompt snippets) benefit from seeding.
 
-## Background watcher: rebuild before anyone needs it (2026-10-14)
+## Prewarm on package changes (2026-10-14)
 
-`scripts/golden-watch.py` (systemd `--user` unit `pi-kv-golden-watch.service`, linked from `scripts/`) polls every 15 s the files that shape the canonical prefix: `~/.pi/agent/AGENTS.md`, `settings.json`, every skill tree, every `~/.pi/agent/extensions/*` directory and every package listed in `settings.json` (`*.ts/js/mjs/cjs/json/md`; `node_modules`, `.git`, tests, venvs and logs skipped; ~670 files, 8 ms per scan). After a change, 45 s of quiet, at least 120 s since the last run and with one idle server slot, it runs one throwaway `pi -p hello` in `~` with a temporary session dir. That fresh worker sees the edit and applies the rules above (resource refresh, extension refresh or adoption, seeded in its own slot). It then deletes the session and its snapshot. If golden is already current, the run costs one 53-token request.
+A polling watcher service was tried first and then removed in favor of an event hook. Pi core (`~/src/pi-agent`, `package-manager-cli.ts`) now runs `~/.pi/agent/hooks/after-package-change <install|remove|update> <source>` detached after a successful `pi install`, `pi remove` or `pi update --extensions`. A missing hook is ignored. `~/.pi/agent/hooks/after-package-change` is a symlink to `scripts/after-package-change`, which runs `scripts/golden-prewarm.py`:
 
-Live:
+1. Waits 5 s so back-to-back package commands land, then waits up to 10 min for a healthy server with an idle slot.
+2. Runs one throwaway `pi -p hello` in `~` with a temporary session dir. That fresh worker loads the new package set, so the rules above apply: extension refresh seeded in its own slot, or fingerprint adoption.
+3. Deletes the session and its snapshot, then logs to `~/.cache/llama-slots/golden-prewarm.log`.
 
-| Change | Watcher result | Next real new session |
-|---|---|---|
-| Add a test skill | refreshed 54 s after the edit, seeded, 2.8 s warm | — |
-| Remove it | refreshed, seeded, 2.3 s warm | 53 tokens prefilled from golden |
+An `flock` keeps one prewarm at a time. A change that arrives during a run queues exactly one rerun.
 
-Tuning: `KV_WATCH_POLL`, `KV_WATCH_QUIET`, `KV_WATCH_MIN_GAP`, `KV_WATCH_PROVIDER/MODEL`, `KV_SERVER`, `PI_BIN`. Logs: `journalctl --user -u pi-kv-golden-watch`.
+Live, with a temporary local package adding one tool:
+
+| Command | Command returned | Background prewarm | Next new session |
+|---|---|---|---|
+| `pi install <pkg>` | 1 s | seeded warm 14.8 s (tool change, so full prefix) | golden hit, 53 tokens |
+| `pi remove <pkg>` | 1 s | waited for a busy server, then a 17.8 s warm | golden hit, 53 tokens |
+
+Not covered by the hook: AGENTS.md/skill edits and extensions deployed by copying files (e.g. `nodriver-browser`). These still refresh lazily in the next new session, as described above. To prewarm after such a deploy, run `scripts/golden-prewarm.py` by hand.
