@@ -90,3 +90,16 @@ Live, piweb-style `pi -p hello` sessions:
 | Following new sessions | 53 tokens | 53 tokens, ~3 s run |
 
 The seed gains nothing for tool changes: Qwen's chat template renders `# Tools … <tools>` first in the system message (`<tools>` at char 73, system text at char 1029 in `/apply-template`), so a tool edit diverges at ~2.7k tokens. That is below the first recurrent (GDN) context checkpoint, so llama-server re-prefills the whole prefix. Only edits that change the system text late in the prompt (skills, AGENTS.md, extension prompt snippets) benefit from seeding.
+
+## Background watcher: rebuild before anyone needs it (2026-10-14)
+
+`scripts/golden-watch.py` (systemd `--user` unit `pi-kv-golden-watch.service`, linked from `scripts/`) polls every 15 s the files that shape the canonical prefix: `~/.pi/agent/AGENTS.md`, `settings.json`, every skill tree, every `~/.pi/agent/extensions/*` directory and every package listed in `settings.json` (`*.ts/js/mjs/cjs/json/md`; `node_modules`, `.git`, tests, venvs and logs skipped; ~670 files, 8 ms per scan). After a change, 45 s of quiet, at least 120 s since the last run and with one idle server slot, it runs one throwaway `pi -p hello` in `~` with a temporary session dir. That fresh worker sees the edit and applies the rules above (resource refresh, extension refresh or adoption, seeded in its own slot). It then deletes the session and its snapshot. If golden is already current, the run costs one 53-token request.
+
+Live:
+
+| Change | Watcher result | Next real new session |
+|---|---|---|
+| Add a test skill | refreshed 54 s after the edit, seeded, 2.8 s warm | — |
+| Remove it | refreshed, seeded, 2.3 s warm | 53 tokens prefilled from golden |
+
+Tuning: `KV_WATCH_POLL`, `KV_WATCH_QUIET`, `KV_WATCH_MIN_GAP`, `KV_WATCH_PROVIDER/MODEL`, `KV_SERVER`, `PI_BIN`. Logs: `journalctl --user -u pi-kv-golden-watch`.
