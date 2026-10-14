@@ -10,6 +10,8 @@ import { BaseCacheManager, computeHash } from '../dist/base-cache.js';
 import { DEFAULT_CONFIG } from '../dist/config.js';
 import { LruManager } from '../dist/lru-manager.js';
 import extension from '../dist/index.js';
+// Real prompts share Pi's opening; only a full variant may update golden on an extension change.
+const P=s=>`${'You are an expert coding assistant operating inside pi. '.repeat(12)}${s}`;
 async function fixture(t) {
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'kv-golden-')); t.after(()=>fs.rm(root,{recursive:true,force:true}));
  const calls=[]; let live=''; let fail=false;
@@ -46,21 +48,21 @@ test('base-cache disabled stays disabled unless the user explicitly forces base-
  await base.ensureGolden('prefix',[],true);assert.ok(await base.getBaseMetadata());
 });
 test('extension update refreshes once, same fingerprint does not, old loaded worker cannot roll it back',async t=>{
- const f=await fixture(t);await f.manager().ensureGolden('prefix',[]);
- const updated=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2,renderedPrefixHash:'new'});
- await updated.ensureGolden('new prefix',[]);
+ const f=await fixture(t);await f.manager().ensureGolden(P('prefix'),[]);
+ const updated=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2,renderedPrefixHash:P('new')});
+ await updated.ensureGolden(P('new prefix'),[]);
  assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,1,'audit only plans the refresh');
- const restored=await updated.checkAndRestore('new prefix',1,[]);
+ const restored=await updated.checkAndRestore(P('new prefix'),1,[]);
  assert.equal(restored.rebuilt,'extensions');
- await updated.ensureGolden('new prefix',[]);await updated.checkAndRestore('new prefix',1,[]);
- const old=f.manager();await old.ensureGolden('prefix',[]);await old.checkAndRestore('prefix',0,[]);
+ await updated.ensureGolden(P('new prefix'),[]);await updated.checkAndRestore(P('new prefix'),1,[]);
+ const old=f.manager();await old.ensureGolden(P('prefix'),[]);await old.checkAndRestore(P('prefix'),0,[]);
  assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,2);
  assert.equal((await updated.getBaseMetadata()).extensionsFingerprint,'v2');
 });
 test('extension refresh is seeded from the old golden in the new session slot',async t=>{
- const f=await fixture(t);const first=f.manager();await first.ensureGolden('prefix',[]);const oldGolden=first.getFilename();
- const updated=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2,renderedPrefixHash:'new'});
- const mark=f.calls.length;await updated.ensureGolden('new prefix',[{name:'tool2'}]);await updated.checkAndRestore('new prefix',1,[{name:'tool2'}]);
+ const f=await fixture(t);const first=f.manager();await first.ensureGolden(P('prefix'),[]);const oldGolden=first.getFilename();
+ const updated=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2,renderedPrefixHash:P('new')});
+ const mark=f.calls.length;await updated.ensureGolden(P('new prefix'),[{name:'tool2'}]);await updated.checkAndRestore(P('new prefix'),1,[{name:'tool2'}]);
  const calls=f.calls.slice(mark);
  const restore=calls.findIndex(c=>c.url.includes('/slots/1?action=restore')&&c.body.filename===oldGolden);
  const warm=calls.findIndex(c=>c.url.endsWith('/completion'));
@@ -70,27 +72,27 @@ test('extension refresh is seeded from the old golden in the new session slot',a
  assert.ok(log.some(r=>r.type==='golden_refreshed'&&r.reason==='extensions'&&r.seeded===true&&r.slot===1));
 });
 test('extension change with an unchanged prefix adopts the new set without a warm',async t=>{
- const f=await fixture(t);await f.manager().ensureGolden('prefix',[]);
+ const f=await fixture(t);await f.manager().ensureGolden(P('prefix'),[]);
  const updated=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2});
- await updated.ensureGolden('prefix',[]);await updated.checkAndRestore('prefix',0,[]);
+ await updated.ensureGolden(P('prefix'),[]);await updated.checkAndRestore(P('prefix'),0,[]);
  assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,1);
  const meta=await updated.getBaseMetadata();assert.equal(meta.extensionsFingerprint,'v2');assert.equal(meta.extensionLoadedAt,2);
- await f.manager().ensureGolden('prefix',[]);
+ await f.manager().ensureGolden(P('prefix'),[]);
  assert.equal((await updated.getBaseMetadata()).extensionsFingerprint,'v2','older worker cannot roll the set back');
 });
 test('foreign cwd cannot replace the canonical golden on an extension-set change',async t=>{
- const f=await fixture(t);await f.manager().ensureGolden('prefix',[]);
+ const f=await fixture(t);await f.manager().ensureGolden(P('prefix'),[]);
  await f.manager({goldenCwd:'/some/project',extensionsFingerprint:'project-tools',extensionLoadedAt:2}).ensureGolden('project prefix',[]);
  assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,1);
 });
 test('failed extension refresh preserves the previous binary and metadata and can retry',async t=>{
- const f=await fixture(t);const old=f.manager();await old.ensureGolden('prefix',[]);const meta=await fs.readFile(old.getMetaPath(),'utf8');
- f.failWarm();const failing=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2});await failing.ensureGolden('new',[]);
- assert.notEqual((await failing.checkAndRestore('new',0,[])).rebuilt,'extensions');
+ const f=await fixture(t);const old=f.manager();await old.ensureGolden(P('prefix'),[]);const meta=await fs.readFile(old.getMetaPath(),'utf8');
+ f.failWarm();const failing=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2});await failing.ensureGolden(P('new'),[]);
+ assert.notEqual((await failing.checkAndRestore(P('new'),0,[])).rebuilt,'extensions');
  const {lastAccessedAt:_a,...before}=JSON.parse(meta);const {lastAccessedAt:_b,...after}=JSON.parse(await fs.readFile(old.getMetaPath(),'utf8'));
  assert.deepEqual(after,before,'fallback restore only touches lastAccessedAt');assert.equal(await fs.readFile(old.getBinPath()+'.ckpt','utf8'),'checkpoint');
- f.failWarm(false);const retry=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2});await retry.ensureGolden('new',[]);
- assert.equal((await retry.checkAndRestore('new',0,[])).rebuilt,'extensions');
+ f.failWarm(false);const retry=f.manager({extensionsFingerprint:'v2',extensionLoadedAt:2});await retry.ensureGolden(P('new'),[]);
+ assert.equal((await retry.checkAndRestore(P('new'),0,[])).rebuilt,'extensions');
  assert.equal((await retry.getBaseMetadata()).extensionsFingerprint,'v2');
 });
 test('concurrent cold managers warm only once',async t=>{
@@ -111,11 +113,11 @@ test('separate OS processes serialize cold golden publication',async t=>{
 test('every outgoing request audits golden, including an already-resident session; loaded update refreshes it',async t=>{
  const f=await fixture(t);const hooks=new Map();
  extension({on:(name,fn)=>hooks.set(name,fn),registerCommand:()=>{}},{loadConfig:()=>f.config,resolve:async()=>({cacheDir:f.root,serverUrl:'http://127.0.0.1:8001',identity:'model-A',generation:'1'})});
- const ctx={cwd:f.root,model:{provider:'local-llama',baseUrl:'http://127.0.0.1:8001/v1'},sessionManager:{getSessionId:()=> 's'},getSystemPrompt:()=> 'prefix',ui:{setStatus:()=>{},notify:()=>{}}};
+ const ctx={cwd:f.root,model:{provider:'local-llama',baseUrl:'http://127.0.0.1:8001/v1'},sessionManager:{getSessionId:()=> 's'},getSystemPrompt:()=> P('prefix'),ui:{setStatus:()=>{},notify:()=>{}}};
  const request=prompt=>hooks.get('before_provider_request')({payload:{messages:[{role:'system',content:prompt}],tools:[]}},ctx);
- await hooks.get('session_start')({extensionsFingerprint:'v1'},ctx);await request('prefix');await request('different prefix');
+ await hooks.get('session_start')({extensionsFingerprint:'v1'},ctx);await request(P('prefix'));await request(P('different prefix'));
  assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,1);
  assert.match(await fs.readFile(path.join(f.root,'golden-warnings.jsonl'),'utf8'),/golden_mismatch/);
- await hooks.get('session_start')({extensionsFingerprint:'v2'},ctx);await request('updated prefix');
+ await hooks.get('session_start')({extensionsFingerprint:'v2'},ctx);await request(P('updated prefix'));
  assert.equal(f.calls.filter(c=>c.url.endsWith('/completion')).length,2);
 });

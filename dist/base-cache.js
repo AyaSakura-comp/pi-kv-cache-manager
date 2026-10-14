@@ -232,6 +232,12 @@ export class BaseCacheManager {
         await writeJsonAtomic(file, store, this.config.signal);
         return entry;
     }
+    /** Opens like golden and still renders every golden context file/skill. */
+    async isFullVariant(systemPrompt, meta) {
+        if (meta.headHash && meta.headHash !== promptHead(systemPrompt))
+            return false;
+        return (await this.resourceEvidence(systemPrompt, meta)).missing.length === 0;
+    }
     /**
      * Silent refresh policy (canonical cwd, same extension set). The prompt must open like golden and
      * keep every golden resource, so subagents and reduced variants never replace it. Then either a
@@ -245,11 +251,9 @@ export class BaseCacheManager {
             return { reason: "requested", hash, rendered };
         if (!mismatch || extensionsChanged || meta.canonicalCwd !== this.config.goldenCwd)
             return undefined;
-        if (meta.headHash && meta.headHash !== promptHead(systemPrompt))
+        if (!await this.isFullVariant(systemPrompt, meta))
             return undefined;
         const evidence = await this.resourceEvidence(systemPrompt, meta);
-        if (evidence.missing.length > 0)
-            return undefined;
         if (evidence.changed.length > 0 && (this.config.extensionLoadedAt ?? 0) > evidence.newest) {
             return { reason: "resources", hash, rendered };
         }
@@ -275,8 +279,11 @@ export class BaseCacheManager {
             const hash = computeHash(systemPrompt, tools);
             const mismatch = !!meta && (meta.promptPrefixHash !== hash || meta.renderedPrefixHash !== this.config.renderedPrefixHash);
             const changed = !!meta && !!this.config.extensionsFingerprint && meta.extensionsFingerprint !== this.config.extensionsFingerprint;
+            // A reduced variant (strict-mode tools, subagent, custom system prompt) also loads a different
+            // extension set; it must open like golden and keep every golden resource to count as an update.
             const canUpdate = changed && meta?.canonicalCwd === this.config.goldenCwd &&
-                (this.config.extensionLoadedAt ?? 0) > (meta?.extensionLoadedAt ?? 0);
+                (this.config.extensionLoadedAt ?? 0) > (meta?.extensionLoadedAt ?? 0) &&
+                (!mismatch || await this.isFullVariant(systemPrompt, meta));
             let present = false;
             try {
                 await fs.access(this.getBinPath());

@@ -127,6 +127,27 @@ test('a worker loaded before the edit, a session missing a golden skill, or a fo
   assert.equal(f.completions().length, 1);
 });
 
+test('a reduced variant loading a different extension set (strict mode, subagent) cannot replace golden', async t => {
+  const f = await fixture(t);
+  await f.manager().ensureGolden(f.prompt('v1'), [], false, { sessionId: 'a' });
+  const cases = [
+    [f.prompt('v1', { head: 'LINE strict mode. Call click with action and id ONLY. '.repeat(20) }), 'strict'],
+    [f.prompt('v1', { withSkill: false }), 'subset'],
+  ];
+  for (const [prompt, session] of cases) {
+    const m = f.manager({ extensionsFingerprint: `v2-${session}`, renderedPrefixHash: `r-${session}`, extensionLoadedAt: Date.now() + 1 });
+    await m.ensureGolden(prompt, [], false, { sessionId: session });
+    const result = await m.checkAndRestore(prompt, 1, []);
+    assert.equal(result.rebuilt, undefined, session);
+  }
+  assert.equal(f.completions().length, 1);
+  assert.equal((await f.manager().getBaseMetadata()).promptPrefixHash, computeHash(f.prompt('v1'), []));
+
+  const full = f.manager({ extensionsFingerprint: 'v3', renderedPrefixHash: 'r-full', extensionLoadedAt: Date.now() + 2 });
+  await full.ensureGolden(f.prompt('v1 plus a new tool'), [], false, { sessionId: 'full' });
+  assert.equal((await full.checkAndRestore(f.prompt('v1 plus a new tool'), 1, [])).rebuilt, 'extensions');
+});
+
 test('the same new prompt from two sessions refreshes without file evidence; old workers cannot roll it back', async t => {
   const f = await fixture(t);
   await f.manager().ensureGolden(f.prompt('v1'), [], false, { sessionId: 'a' });

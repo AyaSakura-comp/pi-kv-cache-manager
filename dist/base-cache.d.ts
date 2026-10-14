@@ -51,6 +51,8 @@ export declare class BaseCacheManager {
     private resourceEvidence;
     /** Records that `sessionId` sent prefix `key`; returns the vote so far. */
     private observe;
+    /** Opens like golden and still renders every golden context file/skill. */
+    private isFullVariant;
     /**
      * Silent refresh policy (canonical cwd, same extension set). The prompt must open like golden and
      * keep every golden resource, so subagents and reduced variants never replace it. Then either a
