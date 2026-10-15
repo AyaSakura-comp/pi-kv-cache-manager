@@ -345,8 +345,10 @@ export default function piKvCacheManager(pi, dependencies = {}) {
             // context replace the slot, it saves any state this file does not have yet (e.g.
             // turns that ended in tool calls, which skip the save below).
             const sessionId = ctx.sessionManager?.getSessionId();
-            if (sessionId)
+            if (sessionId) {
                 event.payload.slot_snapshot = engine.getSnapshotFilename(sessionId);
+                await engine.claimSnapshot(sessionId, ctx.sessionManager?.getSessionName?.());
+            }
             // Ensure preserve_thinking is set so subsequent turns retain assistant thinking blocks in KV cache!
             const currentKwargs = event.payload.chat_template_kwargs || {};
             event.payload.chat_template_kwargs = {

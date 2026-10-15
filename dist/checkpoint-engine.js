@@ -1,4 +1,5 @@
 import { boundedFetch, checkCancelled } from "./request.js";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 export async function fetchSlots(baseUrl, options = {}) {
     const url = `${baseUrl.replace(/\/+$/, "")}/slots`;
@@ -80,6 +81,25 @@ export class CheckpointEngine {
      * Evaluates token progress after a turn and awaits a serialized snapshot
      * save if threshold conditions are met. Server disk I/O is synchronous.
      */
+    /**
+     * Requests name this session's snapshot (slot_snapshot), so llama-server may save it there
+     * before another context evicts the slot, even before this extension's first save (turns that
+     * end in tool calls skip it). Give such a file metadata up front, or the restore would ignore it
+     * and fall back to golden. Never replaces existing metadata, including a save's tombstone.
+     */
+    async claimSnapshot(sessionId, sessionName) {
+        const metaPath = path.join(this.config.cacheDir, this.getSnapshotFilename(sessionId).replace(/\.bin$/, ".meta.json"));
+        const now = new Date().toISOString();
+        const meta = { sessionId, sessionName, tokenCount: 0, fileSizeBytes: 0, createdAt: now,
+            lastAccessedAt: now, promptPrefixHash: "", isBaseSnapshot: false };
+        try {
+            await fs.writeFile(metaPath, JSON.stringify({ ...meta, namespace: this.config.snapshotPrefix }, null, 2), { flag: "wx", signal: this.config.signal });
+        }
+        catch (error) {
+            if (error.code !== "EEXIST")
+                checkCancelled(this.config, error);
+        }
+    }
     async maybeCheckpoint(sessionId, sessionName, currentTokens, slotId = this.config.slotId, onSuccess, onError) {
         checkCancelled(this.config);
         if (!this.config.enableIncrementalSave) {

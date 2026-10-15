@@ -1,4 +1,5 @@
 import { boundedFetch, checkCancelled, type RequestOptions } from "./request.js";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { KvManagerConfig, LlamaSlotActionResponse, LlamaSlotInfo, SnapshotMetadata } from "./types.js";
 import { LruManager } from "./lru-manager.js";
@@ -106,6 +107,25 @@ export class CheckpointEngine {
    * Evaluates token progress after a turn and awaits a serialized snapshot
    * save if threshold conditions are met. Server disk I/O is synchronous.
    */
+  /**
+   * Requests name this session's snapshot (slot_snapshot), so llama-server may save it there
+   * before another context evicts the slot, even before this extension's first save (turns that
+   * end in tool calls skip it). Give such a file metadata up front, or the restore would ignore it
+   * and fall back to golden. Never replaces existing metadata, including a save's tombstone.
+   */
+  async claimSnapshot(sessionId: string, sessionName?: string): Promise<void> {
+    const metaPath = path.join(this.config.cacheDir, this.getSnapshotFilename(sessionId).replace(/\.bin$/, ".meta.json"));
+    const now = new Date().toISOString();
+    const meta: SnapshotMetadata = { sessionId, sessionName, tokenCount: 0, fileSizeBytes: 0, createdAt: now,
+      lastAccessedAt: now, promptPrefixHash: "", isBaseSnapshot: false };
+    try {
+      await fs.writeFile(metaPath, JSON.stringify({ ...meta, namespace: this.config.snapshotPrefix }, null, 2),
+        { flag: "wx", signal: this.config.signal });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") checkCancelled(this.config, error);
+    }
+  }
+
   async maybeCheckpoint(
     sessionId: string,
     sessionName: string | undefined,

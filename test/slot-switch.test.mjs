@@ -89,3 +89,23 @@ test('an active session whose slot was taken by an unowned side request restores
   assert.equal(back.restored, true);
   assert.ok(f.calls.some(c => /action=restore/.test(c.url) && c.body.filename === 'kv2_fixture_snap_B.bin'));
 });
+
+test('a snapshot llama-server saved on eviction before our first save is restored, not ignored in favor of golden', async t => {
+  const f = await fixture(t, [['', 0], ['', 0]]); const h = harness(f);
+  const payload = { messages: [{ role: 'system', content: 'system' }], tools: [{ name: 'tool' }] };
+  await h.hooks.get('before_provider_request')({ payload }, h.ctx);
+  const slot = payload.id_slot;
+  // Tool-call turns skip our save; a planner call evicted the slot and llama-server saved it.
+  await fs.writeFile(path.join(f.root, payload.slot_snapshot), 'server-saved');
+  f.slots[slot][0] = '';
+  f.calls.length = 0;
+  const next = { messages: [{ role: 'system', content: 'system' }], tools: [{ name: 'tool' }] };
+  await h.hooks.get('before_provider_request')({ payload: next }, h.ctx);
+  const restore = f.calls.find(c => /action=restore/.test(c.url));
+  assert.equal(restore?.body.filename, payload.slot_snapshot);
+  // An existing tombstone or real metadata is never replaced by the claim.
+  const meta = path.join(f.root, payload.slot_snapshot.replace(/\.bin$/, '.meta.json'));
+  await fs.writeFile(meta, '{"pending":true}');
+  await h.hooks.get('before_provider_request')({ payload: { messages: next.messages, tools: next.tools } }, h.ctx);
+  assert.equal(await fs.readFile(meta, 'utf8'), '{"pending":true}');
+});
