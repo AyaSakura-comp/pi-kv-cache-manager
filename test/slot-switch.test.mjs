@@ -70,3 +70,22 @@ test('requests name the session snapshot so llama-server can save the slot befor
   assert.equal(typeof payload.id_slot, 'number');
   assert.match(payload.slot_snapshot, /^kv2_[0-9a-f]+_snap_session\.bin$/);
 });
+
+test('an active session whose slot was taken by an unowned side request restores its snapshot instead of re-prefilling', async t => {
+  const f = await fixture(t, [['', 0], ['', 0]]);
+  const lru = new LruManager(f.config.cacheDir, f.config.snapshotPrefix);
+  const engine = new CheckpointEngine(f.config, lru);
+  await engine.maybeCheckpoint('B', 'b', 100, 0);
+  const slots = new SlotManager(f.config, lru, engine, new BaseCacheManager(f.config, lru));
+  const first = await slots.ensureSlotForSession('B', 'system', []);
+  assert.equal(f.slots[first.slotId][0], 'kv2_fixture_snap_B.bin');
+  const resident = await slots.ensureSlotForSession('B', 'system', []);
+  assert.equal(resident.hit, true, 'still resident: no restore');
+
+  // A browser planner call (no slot_snapshot) took the slot; llama-server saved B and now names no owner.
+  f.slots[first.slotId][0] = '';
+  f.calls.length = 0;
+  const back = await slots.ensureSlotForSession('B', 'system', []);
+  assert.equal(back.restored, true);
+  assert.ok(f.calls.some(c => /action=restore/.test(c.url) && c.body.filename === 'kv2_fixture_snap_B.bin'));
+});

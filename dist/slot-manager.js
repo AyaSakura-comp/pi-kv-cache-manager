@@ -50,9 +50,11 @@ export class SlotManager {
             if (activeSid === sessionId) {
                 const live = slots.find((s) => s.id === slotId);
                 if (live) {
-                    if (live.snapshot_filename &&
-                        live.snapshot_filename !== snapFilename &&
-                        live.snapshot_filename !== this.baseCache.getFilename()) {
+                    // llama-server names the owner of the slot's live context (slot_snapshot of the
+                    // last request, or the last save/restore). Anything else, including an empty name
+                    // after an unowned side request (browser/research planner calls), means our context
+                    // was evicted: restore the snapshot the server saved before eviction.
+                    if (live.snapshot_filename !== snapFilename) {
                         this.activeSlotSessions.delete(slotId);
                     }
                     else {
