@@ -65,11 +65,13 @@ export async function restoreSlot(
 
 export async function eraseSlot(baseUrl: string, slotId: number, options: RequestOptions = {}): Promise<void> {
   const url = `${baseUrl.replace(/\/+$/, "")}/slots/${slotId}?action=erase`;
+  // The server first saves a changed slot for its owner (slot_snapshot), and Strata's single slot waits for the
+  // running request: the long deadline, as for save/restore.
   const res = await boundedFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({}),
-  }, options);
+  }, options, true);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`llama-server slot erase failed: ${text}`);

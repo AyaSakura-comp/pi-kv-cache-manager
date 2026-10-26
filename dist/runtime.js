@@ -34,6 +34,81 @@ async function fileIdentity(filename) {
         throw new Error("Expected a local regular file");
     return [real, stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String);
 }
+/**
+ * Strata (Qwen3.8-Flash-Next) serves llama-server's slot API from `python serve/server.py --engine strata
+ * --config <run config>`; the run config names the engine and every model file. Returns the server script and
+ * config path, or undefined for any other listener.
+ */
+function strataServer(exe, argv, cwd) {
+    if (!/^python3?(\.\d+)?$/.test(path.basename(exe)))
+        return undefined;
+    const script = argv.slice(1).find(a => !a.startsWith("-"));
+    if (!script || path.basename(script) !== "server.py" || path.basename(path.dirname(path.resolve(cwd, script))) !== "serve") {
+        return undefined;
+    }
+    if (argument(argv, ["--engine"]) !== "strata")
+        throw new Error("Strata listener does not run the Strata engine");
+    const config = argument(argv, ["--config"]);
+    if (!config)
+        throw new Error("Strata --config is not explicit");
+    return { script: path.resolve(cwd, script), config: path.resolve(cwd, config) };
+}
+/** A model folder (pack, MTP, tokenizer) by the identity of every file in it, a bounded walk. */
+async function treeIdentity(root, depth = 3, budget = { left: 512 }) {
+    const stat = await fs.stat(root);
+    if (stat.isFile())
+        return fileIdentity(root);
+    if (!stat.isDirectory() || depth < 0)
+        throw new Error("Expected a local regular file or folder");
+    const out = [await fs.realpath(root)];
+    for (const name of (await fs.readdir(root)).sort()) {
+        if (--budget.left < 0)
+            throw new Error("Model folder too large to identify");
+        out.push([name, await treeIdentity(path.join(root, name), depth - 1, budget)]);
+    }
+    return out;
+}
+/**
+ * Strata's runtime: its run config (engine, arguments, environment) and the identity of the engine binary, the
+ * server code that renders prompts and every file or folder an argument names. Session files are also bound to
+ * the model and settings by the engine itself, which refuses a mismatched file.
+ */
+async function strataRuntime(server, argv, cwd) {
+    const config = JSON.parse(await fs.readFile(server.config, "utf8"));
+    if (!config || typeof config !== "object" || typeof config.exe !== "string" || !Array.isArray(config.args)) {
+        throw new Error("Strata run config has no engine");
+    }
+    // the engine runs in the config's "cwd" (relative to the server's), which its relative paths start from
+    const base = typeof config.cwd === "string" ? path.resolve(cwd, config.cwd) : cwd;
+    // --slot-save-path is relative to the server's working directory, the config's slot_save_path to its "cwd"
+    const cli = argument(argv, ["--slot-save-path"]);
+    const folder = cli ? path.resolve(cwd, cli) : typeof config.slot_save_path === "string" ? path.resolve(base, config.slot_save_path) : undefined;
+    if (!folder)
+        throw new Error("Server --slot-save-path is not explicit");
+    const files = [];
+    for (const value of [config.exe, ...config.args.filter((a) => typeof a === "string"), config.tokenizer,
+        config.vision?.mmproj, config.vision?.exe]) {
+        if (typeof value !== "string" || value.startsWith("-"))
+            continue;
+        // a control vector is named with its scale (FILE:SCALE); the scale stays in the arguments
+        for (const candidate of [value, value.replace(/:[-+0-9.eE]+$/, "")]) {
+            const file = path.resolve(base, candidate);
+            try {
+                await fs.access(file);
+            }
+            catch {
+                continue;
+            }
+            files.push([candidate, await treeIdentity(file)]);
+            break;
+        }
+    }
+    const serve = path.dirname(server.script);
+    const code = [];
+    for (const name of ["server.py", "frontend.py", "chat_template.jinja"])
+        code.push(await fileIdentity(path.join(serve, name)));
+    return { folder, config, files, code, configFile: await fileIdentity(server.config) };
+}
 /** Only direct, same-namespace Linux listeners are supported. No pgrep or shell. */
 export async function resolveRuntime(baseUrl, io = {}) {
     const url = new URL(baseUrl);
@@ -78,23 +153,25 @@ export async function resolveRuntime(baseUrl, io = {}) {
             throw new Error("Server has a different filesystem root");
         }
         const exe = await fs.readlink(path.join(dir, "exe"));
-        if (path.basename(exe) !== "llama-server")
-            throw new Error("Listener is not llama-server");
         const argv = (await fs.readFile(path.join(dir, "cmdline"), "utf8")).split("\0").filter(Boolean);
         const cwd = await fs.readlink(path.join(dir, "cwd"));
+        const strata = strataServer(exe, argv, cwd);
+        if (path.basename(exe) !== "llama-server" && !strata)
+            throw new Error("Listener is not llama-server or Strata");
         const stat = await fs.readFile(path.join(dir, "stat"), "utf8");
         const start = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[19];
         if (!start)
             throw new Error("Missing process start identity");
         const env = (await fs.readFile(path.join(dir, "environ"), "utf8")).split("\0")
-            .filter(v => /^(LLAMA_ARG_|GGML_|CUDA_|HIP_|ROCR_)/.test(v)).sort();
-        const folder = argument(argv, ["--slot-save-path"]);
+            .filter(v => /^(LLAMA_ARG_|GGML_|CUDA_|HIP_|ROCR_|STRATA_)/.test(v)).sort();
+        const runtime = strata ? await strataRuntime(strata, argv, cwd) : undefined;
+        const folder = runtime ? runtime.folder : argument(argv, ["--slot-save-path"]);
         if (!folder)
             throw new Error("Server --slot-save-path is not explicit");
         const cacheDir = await fs.realpath(path.resolve(cwd, folder));
         if (!(await fs.stat(cacheDir)).isDirectory())
             throw new Error("Snapshot path is not a directory");
-        return { pid, start, inode, argv, cwd, env, cacheDir, executable: await fileIdentity(exe) };
+        return { pid, start, inode, argv, cwd, env, cacheDir, executable: await fileIdentity(exe), strata: runtime };
     };
     const before = await inspect();
     const serverUrl = url.origin;
@@ -108,6 +185,23 @@ export async function resolveRuntime(baseUrl, io = {}) {
     const adapters = await get(`${serverUrl}/lora-adapters`);
     if (typeof props?.model_path !== "string" || !props.model_path || !Array.isArray(adapters)) {
         throw new Error("Server model/adapter identity unavailable");
+    }
+    if (before.strata) {
+        // Strata names its model by the --native GGUF of its run config (or the pack) and loads no adapters.
+        const named = before.strata.files.map(f => f[0]);
+        if (adapters.length || !named.includes(props.model_path))
+            throw new Error("API model does not match listener model");
+        const after = await inspect();
+        if (stableStringify(before) !== stableStringify(after))
+            throw new Error("Listener changed during discovery");
+        const identity = computeHash(stableStringify({
+            version: 2, engine: "strata", serverUrl, addresses, cacheDir: before.cacheDir, argv: before.argv, env: before.env,
+            executable: before.executable, runtime: before.strata,
+            props: { model_alias: props.model_alias, build_info: props.build_info, chat_template: props.chat_template,
+                total_slots: props.total_slots, n_ctx: props.default_generation_settings?.n_ctx },
+        }));
+        io.signal?.throwIfAborted();
+        return { transport, serverUrl, cacheDir: before.cacheDir, identity, generation: `${before.pid}:${before.start}:${before.inode}` };
     }
     const modelPath = path.resolve(before.cwd, props.model_path);
     const modelArg = argument(before.argv, ["-m", "--model"]);

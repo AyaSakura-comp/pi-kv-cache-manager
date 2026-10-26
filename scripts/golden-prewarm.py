@@ -10,11 +10,28 @@ prefix costs one ~53-token request. The session and its snapshot are removed aft
 import fcntl, glob, json, os, shutil, subprocess, sys, tempfile, time, urllib.request
 
 HOME = os.path.expanduser("~")
+
+
+def pi_default():
+    """Pi's default local model (settings.json) and its server (models.json), so the prewarm follows a switch
+    between qwen-mtp (:8001) and Strata (:8090). -> (provider, model, server) or Nones."""
+    agent = os.path.join(HOME, ".pi", "agent")
+    try:
+        with open(os.path.join(agent, "settings.json")) as f:
+            settings = json.load(f)
+        with open(os.path.join(agent, "models.json")) as f:
+            base = json.load(f)["providers"][settings["defaultProvider"]]["baseUrl"]
+        return settings["defaultProvider"], settings["defaultModel"], base.rstrip("/").removesuffix("/v1")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None, None, None
+
+
+DEFAULT_PROVIDER, DEFAULT_MODEL, DEFAULT_SERVER = pi_default()
 CACHE = os.environ.get("KV_CACHE_DIR", os.path.join(HOME, ".cache", "llama-slots"))
-SERVER = os.environ.get("KV_SERVER", "http://127.0.0.1:8001")
+SERVER = os.environ.get("KV_SERVER", DEFAULT_SERVER or "http://127.0.0.1:8001")
 PI_BIN = os.environ.get("PI_BIN", os.path.join(HOME, "src/pi-agent/packages/coding-agent/dist/cli.js"))
-PROVIDER = os.environ.get("KV_PREWARM_PROVIDER", "local-llama")
-MODEL = os.environ.get("KV_PREWARM_MODEL", "qwen3.6-35b-q4")
+PROVIDER = os.environ.get("KV_PREWARM_PROVIDER", DEFAULT_PROVIDER or "local-llama")
+MODEL = os.environ.get("KV_PREWARM_MODEL", DEFAULT_MODEL or "qwen3.6-35b-q4")
 SETTLE = float(os.environ.get("KV_PREWARM_SETTLE", "5"))
 WAIT_IDLE = float(os.environ.get("KV_PREWARM_WAIT_IDLE", "600"))
 LOG = os.path.join(CACHE, "golden-prewarm.log")

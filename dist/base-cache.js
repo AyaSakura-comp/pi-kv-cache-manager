@@ -553,7 +553,10 @@ export class BaseCacheManager {
             const data = (await templateRes.json());
             if (typeof data.prompt !== "string")
                 throw new Error("Missing formatted prefix");
-            formattedPrompt = data.prompt;
+            // Strata also returns the ids its chat path reads for the prefix (a literal <think> or <|im_end|> inside a
+            // message stays text there, which re-tokenizing the text would turn into control tokens).
+            formattedPrompt = Array.isArray(data.tokens) && data.tokens.length > 0 &&
+                data.tokens.every(t => Number.isInteger(t) && t >= 0) ? data.tokens : data.prompt;
         }
         catch (error) {
             // Never label raw, untemplated tokens as a valid golden prefix.

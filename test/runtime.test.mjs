@@ -140,3 +140,64 @@ for (const hostname of ['127.0.0.1','localhost']) test(`${hostname}: listener/pr
   await assert.rejects(resolveRuntime('http://localhost:8001/v1',{...f.deps,dnsTimeoutMs:20,lookup:()=>new Promise(()=>{}),listener:async()=>{called=true;return '';}}), /DNS deadline/);
   assert.equal(called,false);
  });
+
+async function strataFixture(t) {
+  const f = await fixture(t);
+  const {root} = f;
+  for (const p of ['serve','pack/tokenizer','A']) await fs.mkdir(path.join(root,p), {recursive:true});
+  for (const n of ['server.py','frontend.py','chat_template.jinja']) await fs.writeFile(path.join(root,'serve',n),n);
+  await fs.writeFile(path.join(root,'strata'),'engine');
+  await fs.writeFile(path.join(root,'pack/experts.bin'),'experts');
+  await fs.writeFile(path.join(root,'pack/tokenizer/tokenizer.json'),'{}');
+  await fs.writeFile(path.join(root,'cvec.gguf'),'cvec');
+  await fs.writeFile(path.join(root,'python3.13'),'python');
+  await fs.unlink(path.join(root,'proc/42/exe'));
+  await fs.symlink(path.join(root,'python3.13'),path.join(root,'proc/42/exe'));
+  const config = {exe:'strata', cwd:root, slot_save_path:'A', tokenizer:'pack/tokenizer',
+    args:['--pack','pack','--native','model.gguf','--kv','int8','--control-vector-scaled','cvec.gguf:1.0']};
+  const write = async (c=config) => fs.writeFile(path.join(root,'run.json'),JSON.stringify(c));
+  await write();
+  const cmd = async (extra=[], engine='strata') => fs.writeFile(path.join(root,'proc/42/cmdline'),
+    ['.venv/bin/python',path.join(root,'serve/server.py'),'--engine',engine,'--config','run.json','--port','8090',...extra].join('\0')+'\0');
+  await cmd();
+  f.setSS('LISTEN 0 5 127.0.0.1:8090 0.0.0.0:* users:(("python",pid=42,fd=6)) ino:123');
+  f.deps.json = async url => url.endsWith('/props') ? {model_path:'model.gguf',model_alias:'qwen3.8-flash',build_info:'Strata 0.1.40',
+    total_slots:1,default_generation_settings:{n_ctx:262144,params:{temperature:Math.random()}}} : [];
+  return {...f,config,write,cmd};
+}
+
+test('Strata listener: run config names the slot path, model files and engine identity', async t => {
+  const f = await strataFixture(t);
+  const resolve = () => resolveRuntime('http://127.0.0.1:8090/v1', f.deps);
+  const a = await resolve();
+  assert.equal(a.cacheDir, path.join(f.root,'A'));
+  assert.equal((await resolve()).identity, a.identity);       // shared sampling settings are not identity
+  await fs.writeFile(path.join(f.root,'pack/experts.bin'),'other experts');
+  const b = await resolve(); assert.notEqual(b.identity, a.identity);
+  await fs.writeFile(path.join(f.root,'cvec.gguf'),'other cvec');
+  const c = await resolve(); assert.notEqual(c.identity, b.identity);
+  await f.write({...f.config, args:[...f.config.args,'--kv-resident','32768']});
+  const d = await resolve(); assert.notEqual(d.identity, c.identity);
+  await fs.writeFile(path.join(f.root,'serve/chat_template.jinja'),'another template');
+  assert.notEqual((await resolve()).identity, d.identity);
+  await f.cmd(['--slot-save-path','B']);
+  assert.equal((await resolve()).cacheDir, path.join(f.root,'B'));
+});
+
+test('Strata listener without a slot path, with the mock engine, adapters or another model fails closed', async t => {
+  const f = await strataFixture(t);
+  const resolve = () => resolveRuntime('http://127.0.0.1:8090/v1', f.deps);
+  const {slot_save_path, ...noSlots} = f.config;
+  await f.write(noSlots); await assert.rejects(resolve(), /slot-save-path/);
+  await f.write();
+  await f.cmd([], 'mock'); await assert.rejects(resolve(), /Strata engine/);
+  await f.cmd();
+  const props = f.deps.json;
+  f.deps.json = async url => url.endsWith('/props') ? props(url) : [{id:0,path:'adapter.gguf',scale:1}];
+  await assert.rejects(resolve(), /does not match/);
+  f.deps.json = async url => url.endsWith('/props') ? {...await props(url), model_path:'other.gguf'} : [];
+  await assert.rejects(resolve(), /does not match/);
+  f.deps.json = props;
+  await fs.writeFile(path.join(f.root,'proc/42/cmdline'),['python3','other.py','--engine','strata','--config','run.json'].join('\0')+'\0');
+  await assert.rejects(resolve(), /not llama-server or Strata/);
+});

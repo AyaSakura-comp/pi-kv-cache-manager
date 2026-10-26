@@ -15,6 +15,15 @@ See [Snapshot dependencies and validation, 2026-10-05](docs/snapshot-release-202
 
 See [Silent golden refresh, 2026-10-13](docs/golden-refresh-20261013.md) for AGENTS.md/skill-triggered golden refresh, piweb `/kv base-update`, the discovery-timeout fix and live measurements. Known race measured there: two simultaneous new sessions in separate Pi processes can pick the same slot, and one session's late checkpoint can then save the other session's context into its own snapshot file. Outputs stay correct (token verification), but that session loses its cache on the next restore.
 
+## Strata (Qwen3.8-Flash-Next), 2026-10-27
+
+The same lifecycle works on [Strata](https://github.com/Niko1221/Strata)'s single slot (`python serve/server.py --engine strata --config <run config>`), with the slot layer added to its server (`serve/server.py`: `slot_snapshot` owner + save-before-evict, `erase`, `/apply-template` returning the chat path's token ids, `/completion` with `n_predict: 0`, `/lora-adapters`).
+- Discovery verifies the listener like llama-server's (same namespace/root, one owner). The python process must run `serve/server.py --engine strata --config FILE`. The snapshot folder is `--slot-save-path` or the run config's `slot_save_path` (relative to its `cwd`). Identity = the run config, the engine binary, every file/folder its arguments name (pack, GGUF shards, MTP, control vector, tokenizer, mmproj), Strata's prompt-rendering code and `/props`. The engine itself also refuses session files of another model or configuration.
+- The warm sends `/apply-template`'s `tokens` to `/completion`, not the text: Strata keeps a literal `<think>`/`<|im_end|>` inside a message as text, which re-tokenizing the text would not.
+- Run the Strata config with `"effort_position": "end"`. Otherwise the reasoning-effort sentence opens the system turn and every pi thinking level gets its own prefix and golden.
+- Live (IQ3_S abliterated, 27k-token pi prefix, NVMe): cold golden 24.4 s (649 MB). A new session then restores golden in ~0.29 s and reads only its new ~90 tokens (3.7–4.8 s wall vs 29.7 s cold), at every thinking level. Session save 0.26 s and restore 0.29 s at ~27k tokens. An unowned planner call during a tool turn made Strata save the session first (1.4 s); the next turn restored it and reused 27,136 tokens. Snapshots survive a Strata restart.
+- Erase timeouts use the long (prefill) deadline: erase may save a changed slot first, and Strata's slot waits for the running request.
+
 ## Single canonical golden
 
 - Each verified model/adapter runtime has one `golden_<runtime-hash>_base_system_prompt.bin` and matching metadata/tools/sidecars. Session checkpoints remain `kv2_<runtime-and-rendered-prefix-hash>_snap_<id>.bin`; prompt differences never allocate another golden.

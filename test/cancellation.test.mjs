@@ -23,12 +23,11 @@ for(const body of [false,true]) test(`control deadlines cover stalled ${body?'bo
     if(!body) return stall(opts.signal);
     return {ok:true,json:()=>stall(opts.signal),text:()=>stall(opts.signal)};
   };
-  for(const run of [o=>fetchSlots('http://127.0.0.1',o),o=>eraseSlot('http://127.0.0.1',0,o)]) {
-    await assert.rejects(run({controlTimeoutMs:20}));
-  }
+  await assert.rejects(fetchSlots('http://127.0.0.1',{controlTimeoutMs:20}));
   // Slot save/restore move hundreds of MB and queue behind running work on the slot:
-  // they get the long (prefill) deadline, never the short control one.
-  for(const run of [o=>saveSlot('http://127.0.0.1',0,'x',o),o=>restoreSlot('http://127.0.0.1',0,'x',o)]) {
+  // they get the long (prefill) deadline, never the short control one. So does erase,
+  // which first saves a changed slot for its owner (slot_snapshot).
+  for(const run of [o=>saveSlot('http://127.0.0.1',0,'x',o),o=>restoreSlot('http://127.0.0.1',0,'x',o),o=>eraseSlot('http://127.0.0.1',0,o)]) {
     let settled=false;
     const pending=run({controlTimeoutMs:20,prefillTimeoutMs:150}).catch(e=>{settled=true;throw e;});
     await new Promise(r=>setTimeout(r,80));
